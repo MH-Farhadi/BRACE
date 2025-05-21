@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+# train_bayesian_reacher.py
+# -----------------------------------------------------------
+#  Fits BayesianIntent parameters offline from expert demos
+# -----------------------------------------------------------
+import torch, gymnasium as gym, argparse
+from torch import optim
+from torch.utils.data import DataLoader, TensorDataset
+from train_brace_integrated_reacher import BayesianIntent, split_obs, GOAL_RADIUS
+
+def collect(n_traj=400, max_len=150):
+    env = gym.make("Reacher-v4")
+    obs, _ = env.reset()
+    data = []
+    for _ in range(n_traj):
+        env.reset()
+        traj=[]
+        for _ in range(max_len):
+            act = env.action_space.sample()          # random human
+            obs,_,d,_,_ = env.step(act)
+            traj.append(obs)
+            if d: break
+        data.append(traj)
+    obs_arr = torch.tensor([o for traj in data for o in traj], dtype=torch.float32)
+    return obs_arr
+
+def train(dataset_obs):
+    tip,_ = split_obs(dataset_obs)
+    # fake human vec: derivative of fingertip, approx with difference
+    h_vec = torch.zeros_like(tip)
+    h_vec[1:] = tip[1:] - tip[:-1]
+    h_vec[0]  = h_vec[1]
+    belief = None
+
+    model = BayesianIntent().cuda() if torch.cuda.is_available() else BayesianIntent()
+    model.train()
+    opt = optim.Adam(model.parameters(), 1e-2)
+    loader = DataLoader(TensorDataset(tip, h_vec), batch_size=512, shuffle=True)
+
+    for epoch in range(200):
+        loss_epoch = 0.0
+        for fp, hv in loader:
+            fp = fp.to(next(model.parameters()).device)
+            hv = hv.to(fp)
+            belief, nll = model(fp, hv, belief=None)
+            opt.zero_grad()
+            nll.backward()
+            opt.step()
+            loss_epoch += nll.item()*len(fp)
+        if epoch%20==0:
+            print(f"epoch {epoch:03d}  nll {loss_epoch/len(dataset_obs):.4f}")
+    torch.save(model.state_dict(), "bayes_reacher.pt")
+    print("✓ saved bayes_reacher.pt")
+
+if __name__ == "__main__":
+    ds = collect()
+    train(ds)
+

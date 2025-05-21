@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+# train_expert_brace.py
+# -----------------------------------------------------------
+#  Train an expert SAC policy that can reach goals autonomously
+# -----------------------------------------------------------
+import os, math, random, argparse
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+
+import torch
+from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import BaseCallback
+
+# ------------------- geometry / constants ------------------
+FULL          = np.array([1200, 800], dtype=np.float32)
+MAX_SPEED     = 5.0
+DOT_R         = 14
+OBS_R         = 10
+TGT_R         = 9
+STEP_PENALTY  = -0.01        # small living‑cost
+GOAL_BONUS    =  2.0
+COLLIDE_PENAL = -4.0
+
+def distance(a, b): return np.linalg.norm(a-b, ord=2)
+
+# ------------------- Expert environment --------------------
+class BraceExpertEnv(gym.Env):
+    """
+    action  : Δx,Δy in [-1,1]^2   → scaled by MAX_SPEED
+    state   : [cursor_x, cursor_y, goal_x, goal_y,
+               d_goal_norm, min_obs_norm]
+    reward  : shaped negative distance + bonuses/penalties
+    """
+    metadata = {"render_modes": []}
+    def __init__(self, n_goals=8, seed=None, visualize=False):
+        super().__init__()
+        self.rng = np.random.default_rng(seed)
+        self.visualize = visualize
+        self.n_goals = n_goals
+        # spaces
+        low  = np.array([0,0,  0,0,  0,0], dtype=np.float32)
+        high = np.array([*FULL, *FULL, 1,1], dtype=np.float32)
+        self.observation_space = spaces.Box(low, high, dtype=np.float32)
+        self.action_space      = spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
+
+        self.max_dist = np.linalg.norm(FULL)
+        self.goal_thr = 36.0
+        if visualize:
+            import pygame
+            pygame.init()
+            self.pg = pygame
+            self.screen = pygame.display.set_mode(FULL)
+            self.clock  = pygame.time.Clock()
+
+    # -------------------------------------------------------
+    def _generate_layout(self):
+        margin = 70
+        self.cursor = FULL/2
+        goals = []
+        while len(goals) < self.n_goals:
+            p = self.rng.uniform([margin,margin], FULL-[margin,margin])
+            if distance(p, self.cursor) > 260:
+                goals.append(p)
+        self.goals = np.stack(goals, axis=0)
+        self.goal_xy = self.goals[self.rng.integers(self.n_goals)]
+
+        # three obstacles on the way
+        obstacles = []
+        for g in self.goals[:3]:
+            t  = self.rng.uniform(0.55,0.8)
+            base = self.cursor + t*(g-self.cursor)
+            perp = np.array([-(g-self.cursor)[1], (g-self.cursor)[0]])
+            perp /= np.linalg.norm(perp)+1e-9
+            off = perp*self.rng.uniform(60,80)*self.rng.choice([-1,1])
+            obstacles.append(base+off)
+        self.obstacles = np.stack(obstacles, axis=0)
+
+    # -------------------------------------------------------
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self._generate_layout()
+        self.t = 0
+        return self._get_obs(), {}
+
+    # -------------------------------------------------------
+    def _get_obs(self):
+        d_goal_norm = distance(self.cursor, self.goal_xy)/self.max_dist
+        d_obs_norm  = np.min(np.linalg.norm(self.cursor-self.obstacles, axis=1))/self.max_dist
+        return np.concatenate([self.cursor, self.goal_xy,
+                               [d_goal_norm, d_obs_norm]]).astype(np.float32)
+
+    # -------------------------------------------------------
+    def _render(self):
+        if not self.visualize: return
+        for e in self.pg.event.get():
+            if e.type == self.pg.QUIT: self.pg.quit(); exit()
+        self.screen.fill((255,255,255))
+        for o in self.obstacles:
+            self.pg.draw.circle(self.screen, (128,128,128), o.astype(int), OBS_R)
+        for g in self.goals:
+            self.pg.draw.circle(self.screen, (255,255,0), g.astype(int), TGT_R)
+        self.pg.draw.circle(self.screen, (0,0,0), self.goal_xy.astype(int), TGT_R+2, 2)
+        self.pg.draw.circle(self.screen, (0,0,0), self.cursor.astype(int), DOT_R, 2)
+        self.pg.display.flip()
+        self.clock.tick(30)
+
+    # -------------------------------------------------------
+    def step(self, action):
+        a = np.clip(action, -1, 1)
+        self.cursor = np.clip(self.cursor + a*MAX_SPEED, [0,0], FULL)
+        self.t += 1
+
+        # distances
+        d_goal = distance(self.cursor, self.goal_xy)
+        d_obs  = np.min(np.linalg.norm(self.cursor-self.obstacles, axis=1))
+        collide = d_obs < DOT_R+OBS_R
+
+        # shaped reward
+        reward = STEP_PENALTY + (self.prev_d - d_goal)*0.5 if hasattr(self, "prev_d") else 0
+        self.prev_d = d_goal
+        if collide: reward += COLLIDE_PENAL
+        reached = d_goal < self.goal_thr
+        if reached: reward += GOAL_BONUS
+
+        terminated = collide or reached
+        truncated  = self.t >= 400
+        info = {}
+        if self.visualize: self._render()
+        return self._get_obs(), float(reward), terminated, truncated, info
+
+    # -------------------------------------------------------
+    def close(self):
+        if self.visualize:
+            self.pg.quit()
+        super().close()
+
+# ------------------- simple save callback ------------------
+class SaveCB(BaseCallback):
+    def __init__(self, path="expert_sac.zip"): super().__init__(); self.path=path
+    def _on_training_end(self): self.model.save(self.path); print("✓ expert saved to", self.path)
+
+# ===========================================================
+#  Train / watch helpers
+# ===========================================================
+def train_expert(steps:int=1_000_000):
+    env = DummyVecEnv([lambda: BraceExpertEnv()])
+    model = SAC(
+        "MlpPolicy", env,
+        learning_rate=3e-4,
+        buffer_size=300_000,
+        batch_size=1024,
+        tau=0.005, gamma=0.995,
+        train_freq=64, gradient_steps=64,
+        learning_starts=5000,
+        verbose=1, tensorboard_log="./tb_expert")
+    model.learn(steps, callback=SaveCB())
+
+def watch_expert(path="expert_sac.zip"):
+    model = SAC.load(path)
+    env   = BraceExpertEnv(visualize=True)
+    obs,_ = env.reset()
+    done=trunc=False
+    R=0
+    while not(done or trunc):
+        act,_ = model.predict(obs, deterministic=True)
+        obs,r,done,trunc,_ = env.step(act)
+        R += r
+    print("episode return:", R)
+    env.close()
+
+# ===========================================================
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--watch", action="store_true")
+    ap.add_argument("--steps", type=int, default=1_000_000)
+    args = ap.parse_args()
+    if args.watch:
+        watch_expert()
+    else:
+        train_expert(args.steps)
+

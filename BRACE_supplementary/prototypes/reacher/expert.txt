@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+# train_expert_reacher.py
+# -----------------------------------------------------------
+#  Trains and saves an expert SAC policy for Reacher‑v4
+# -----------------------------------------------------------
+import os, argparse
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import gymnasium as gym
+from stable_baselines3 import SAC
+
+def train(total_steps: int = 1_000_000, out_path: str = "expert_reacher.zip"):
+    env = gym.make("Reacher-v4")               # requires mujoco
+    model = SAC(
+        "MlpPolicy", env,
+        learning_rate=3e-4,
+        buffer_size=400_000,
+        batch_size=1024,
+        tau=0.005, gamma=0.99,
+        train_freq=64, gradient_steps=64,
+        learning_starts=10_000,
+        verbose=1,
+        tensorboard_log="./tb_expert_reacher"
+    )
+    model.learn(total_steps)
+    model.save(out_path)
+    print("✓ expert saved to", out_path)
+
+def watch(model_path="expert_reacher.zip"):
+    env = gym.make("Reacher-v4", render_mode="human")
+    model = SAC.load(model_path)
+    obs, _ = env.reset(seed=0)
+    done = trunc = False
+    ep_ret = 0.0
+    while not (done or trunc):
+        act, _ = model.predict(obs, deterministic=True)
+        obs, r, done, trunc, _ = env.step(act)
+        ep_ret += r
+    print("return:", ep_ret)
+    env.close()
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--watch", action="store_true")
+    ap.add_argument("--steps", type=int, default=1_000_000)
+    args = ap.parse_args()
+    if args.watch:
+        watch()
+    else:
+        train(args.steps)
+

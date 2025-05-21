@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+# train_brace_integrated_reacher.py
+# -----------------------------------------------------------
+#  Integrated BRACE training (Algorithm 1) for Reacher‑v4
+# -----------------------------------------------------------
+import os, math, argparse, collections
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import torch, torch.nn as nn, torch.optim as optim
+from torch.distributions import Normal
+import numpy as np
+import gymnasium as gym
+from stable_baselines3 import SAC
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+GOAL_RADIUS = 0.18                         # fixed radius of MuJoCo target
+
+# ------------------------------------------------------------------
+#  1. helper: extract fingertip position from env.observation
+#     Reacher‑v4 obs = 11‑D: [cosθ1, sinθ1, cosθ2, sinθ2, θ̇1, θ̇2,
+#                             fingertip_x, fingertip_y,
+#                             target_x, target_y]
+def split_obs(obs):                         # obs: Tensor (B,11)
+    tip = obs[:, 6:8]
+    target = obs[:, 8:10]
+    return tip, target
+
+# ------------------------------------------------------------------
+#  2.  Bayesian goal‑inference module (learnable)
+class BayesianIntent(nn.Module):
+    """
+    Candidate goals are the 8 fixed points on a circle of radius GOAL_RADIUS.
+    The true MuJoCo target is always *one* of them, but the policy does not
+    know which one initially.
+    """
+    def __init__(self):
+        super().__init__()
+        # fixed candidates in xy plane
+        th = torch.linspace(0, 2*math.pi, 9)[:-1]
+        self.register_buffer("goals", torch.stack([GOAL_RADIUS*torch.cos(th),
+                                                   GOAL_RADIUS*torch.sin(th)], 1)) # (8,2)
+        self.raw_beta   = nn.Parameter(torch.tensor(2.0))
+        self.raw_wang   = nn.Parameter(torch.tensor(0.8))
+
+    def forward(self, fingertip, human_vec, belief=None):
+        """
+        fingertip, human_vec : (B,2)
+        belief (prev)        : (B,8) or None
+        returns new belief (B,8) and −log p step for REINFORCE
+        """
+        beta = torch.nn.functional.softplus(self.raw_beta)
+        wang = torch.nn.functional.softplus(self.raw_wang)
+
+        vec_to_g = self.goals[None,:,:] - fingertip[:,None,:]   # B×8×2
+        dir_g    = vec_to_g / (vec_to_g.norm(dim=-1, keepdim=True)+1e-8)
+        h_dir    = human_vec / (human_vec.norm(dim=-1, keepdim=True)+1e-8)
+        angle    = torch.arccos(torch.clamp((dir_g*h_dir[:,None,:]).sum(-1), -1., 1.)) # B×8
+        ll       = torch.exp(-beta*wang*angle)                  # likelihood (B×8)
+        if belief is None:
+            belief = torch.ones_like(ll)/ll.size(1)
+        belief   = belief * ll
+        belief   = belief / belief.sum(dim=1, keepdim=True)
+        neglogp  = -torch.log((belief.detach()*ll).sum(dim=1)+1e-9).mean()
+        return belief, neglogp
+
+# ------------------------------------------------------------------
+#  3.  γ‑Actor‑Critic
+class GammaAC(nn.Module):
+    def __init__(self, obs_dim):
+        super().__init__()
+        hid = 256
+        self.shared = nn.Sequential(nn.Linear(obs_dim, hid),
+                                    nn.ReLU(),
+                                    nn.Linear(hid, hid),
+                                    nn.ReLU())
+        self.mu_head  = nn.Linear(hid, 1)
+        self.log_std  = nn.Parameter(torch.zeros(1))
+        self.v_head   = nn.Linear(hid, 1)
+
+    def forward(self, obs, deterministic=False):
+        feat = self.shared(obs)
+        mu   = torch.tanh(self.mu_head(feat))
+        std  = torch.exp(self.log_std).clip(1e-3, 1.0)
+        dist = Normal(mu, std)
+        a    = mu if deterministic else torch.tanh(dist.rsample())
+        logp = dist.log_prob(a).sum(-1, keepdim=True)
+        v    = self.v_head(feat)
+        return a, logp, v
+
+# ------------------------------------------------------------------
+#  4.  Integrated simulator (vectorised, pure torch)
+class VecReacher:
+    def __init__(self, n_env:int, expert_path="expert_reacher.zip"):
+        self.n = n_env
+        self.envs = [gym.make("Reacher-v4") for _ in range(n_env)]
+        self.obs  = np.stack([e.reset(seed=i)[0] for i,e in enumerate(self.envs)])
+        self.done = np.zeros(n_env, dtype=np.bool_)
+        self.steps= np.zeros(n_env, dtype=np.int32)
+
+        # preload expert (frozen)
+        self.expert = SAC.load(expert_path, device=DEVICE)
+        self.expert.policy.eval()
+        for p in self.expert.policy.parameters(): p.requires_grad_(False)
+
+    def get_w_action(self, obs_np):
+        a,_ = self.expert.predict(obs_np, deterministic=True)
+        return torch.tensor(a, dtype=torch.float32, device=DEVICE)  # (n,2)
+
+    def step(self, blended_act):
+        """
+        blended_act: torch (n,2)  in torque space, clipped automatically
+        returns: obs_torch, reward_tensor, done_mask
+        """
+        acts = blended_act.detach().cpu().numpy()
+        new_obs, rews, dones, truncs = [],[],[],[]
+        for i,e in enumerate(self.envs):
+            if self.done[i]:
+                new_obs.append(self.obs[i])
+                rews.append(0.0)
+                dones.append(True)
+                truncs.append(False)
+                continue
+            ob, r, d, tr, _ = e.step(acts[i])
+            new_obs.append(ob)
+            rews.append(r)
+            dones.append(d)
+            truncs.append(tr)
+            if d or tr: ob,_ = e.reset()
+            self.done[i] = d or tr
+            self.steps[i]+=1
+        self.obs = np.stack(new_obs)
+        return torch.tensor(self.obs, dtype=torch.float32, device=DEVICE), \
+               torch.tensor(rews, dtype=torch.float32, device=DEVICE), \
+               torch.tensor(dones, dtype=torch.bool,  device=DEVICE)
+
+# ------------------------------------------------------------------
+#  5.  Training loop
+def train_brace(total_epochs=8000, n_env=32, rollout_len=64):
+    world   = VecReacher(n_env)
+    bayes   = BayesianIntent().to(DEVICE)
+    gamma_pi= GammaAC(obs_dim=11 + 8).to(DEVICE)          # 11 env obs + 8‑belief
+    opt_pi  = optim.Adam(gamma_pi.parameters(), 3e-4)
+    opt_b   = optim.Adam(bayes.parameters(),   1e-3)
+
+    for ep in range(total_epochs):
+        belief = torch.ones(n_env,8,device=DEVICE)/8
+        buffers = {"r":[], "logp_a":[], "logp_b":[], "v":[], "done":[]}
+        for t in range(rollout_len):
+            obs = torch.tensor(world.obs, dtype=torch.float32, device=DEVICE)
+            tip, target = split_obs(obs)
+            w_act = world.get_w_action(world.obs)
+
+            # simulated noisy human torque
+            h_act = w_act + torch.randn_like(w_act)*0.1
+
+            # Bayesian update (uses fingertip + direction of h_act in joint space)
+            belief, neglogp_h = bayes(tip, h_act, belief)
+
+            # policy input
+            inp = torch.cat([obs, belief], dim=1)
+            a, logp_a, v = gamma_pi(inp)
+            gamma = 0.5*(a+1.0)
+            blend_act = gamma*w_act + (1-gamma)*h_act
+            next_obs, r, done = world.step(blend_act)
+
+            # store
+            buffers["r"].append(r)
+            buffers["logp_a"].append(logp_a.squeeze(-1))
+            buffers["logp_b"].append(-neglogp_h)          # +log p
+            buffers["v"].append(v.squeeze(-1))
+            buffers["done"].append(done.float())
+
+        # cat to tensors: T×B
+        R   = torch.stack(buffers["r"])
+        V   = torch.stack(buffers["v"])
+        logp_a = torch.stack(buffers["logp_a"])
+        logp_b = torch.stack(buffers["logp_b"])
+        D   = torch.stack(buffers["done"])
+
+        with torch.no_grad():
+            G, adv = torch.zeros_like(R), torch.zeros_like(R)
+            future = torch.zeros(n_env, device=DEVICE)
+            for t in reversed(range(rollout_len)):
+                future = R[t] + 0.99*future*(1-D[t])
+                G[t]   = future
+            adv = G - V
+
+        # losses
+        policy_loss = -(adv.detach()*logp_a).mean()
+        value_loss  = 0.5*((G-V)**2).mean()
+        entropy_reg = -0.0005 * (- (logp_a.exp()+1e-9).log()).mean()
+        loss_pi = policy_loss + value_loss + entropy_reg
+
+        reinforce_b = -(adv.detach()*logp_b).mean()
+
+        opt_pi.zero_grad()
+        loss_pi.backward()
+        opt_pi.step()
+
+        opt_b.zero_grad()
+        reinforce_b.backward()
+        opt_b.step()
+
+        if ep % 100 == 0:
+            print(f"ep {ep:04d} | R {R.sum(0).mean():6.2f} "
+                  f"| π {loss_pi.item():6.3f} | B {reinforce_b.item():6.3f}")
+
+    torch.save({"gamma": gamma_pi.state_dict(),
+                "bayes": bayes.state_dict()},
+               "brace_integrated_reacher.pt")
+    print("✓ saved brace_integrated_reacher.pt")
+
+# ------------------------------------------------------------------
+#  6.  Demo viewer
+def watch(model_path="brace_integrated_reacher.pt"):
+    ckpt   = torch.load(model_path, map_location=DEVICE)
+    bayes  = BayesianIntent().to(DEVICE)
+    gamma  = GammaAC(obs_dim=11+8).to(DEVICE)
+    gamma.load_state_dict(ckpt["gamma"]); gamma.eval()
+    bayes.load_state_dict(ckpt["bayes"]); bayes.eval()
+
+    env = gym.make("Reacher-v4", render_mode="human")
+    obs,_ = env.reset(seed=0)
+    belief = torch.ones(1,8,device=DEVICE)/8
+    ep_ret = 0.0
+    for _ in range(600):
+        ob_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        tip, _ = split_obs(ob_t)
+        w_act = SAC.load("expert_reacher.zip", device=DEVICE).predict(obs, deterministic=True)[0]
+        w_act = torch.tensor(w_act, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        h_act = w_act                                 # no noise for demo
+        belief,_ = bayes(tip, h_act, belief)
+        inp = torch.cat([ob_t, belief], dim=1)
+        a,_,_ = gamma(inp, deterministic=True)
+        gamma_val = 0.5*(a+1.0)
+        act = (gamma_val*w_act + (1-gamma_val)*h_act).squeeze(0).cpu().numpy()
+        obs, r, done, trunc, _ = env.step(act)
+        ep_ret += r
+        if done or trunc: break
+    print("return:", ep_ret)
+    env.close()
+
+# ------------------------------------------------------------------
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--watch", action="store_true")
+    args = ap.parse_args()
+    if args.watch:
+        watch()
+    else:
+        train_brace()
+

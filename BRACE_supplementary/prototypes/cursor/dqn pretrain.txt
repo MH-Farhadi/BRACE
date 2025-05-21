@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""
+train_dqn_gamma.py
+──────────────────
+Pre‑trains a *discrete* γ‑controller with DQN for the cursor‑control
+environment.  The controller maps a 10‑D state  →  γ ∈ {0.0, 0.05, …, 1.0}.
+Reward shaping is identical to the PPO setup in BRACE (§A.2).
+
+Output
+------
+  dqn_gamma.pt      # torch state‑dict (q_net)
+  dqn_gamma.zip     # full SB3 model            (for inspection)
+
+Requirements
+------------
+pip install stable-baselines3==2.2.1 torch numpy gymnasium
+"""
+
+import os, math, argparse, pathlib
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+import torch
+from stable_baselines3 import DQN
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+# ----------------------------------------------------------------------
+# 1)  Import the same cursor environment you used before
+# ----------------------------------------------------------------------
+from demo_arbitration_env import DemoArbitrationEnv     # 10‑D obs, γ∈[-1,1]
+
+# ----------------------------------------------------------------------
+# 2)  Wrap env:  discrete index 0..K‑1  →  gamma∈[-1,1]
+# ----------------------------------------------------------------------
+class GammaDiscretizer(gym.ActionWrapper):
+    def __init__(self, env: gym.Env, n_bins: int = 21):
+        super().__init__(env)
+        self.n_bins = n_bins
+        self.action_space = spaces.Discrete(n_bins)
+        # pre‑compute mapping
+        self.disc2cont = np.linspace(-1.0, 1.0, n_bins, dtype=np.float32)
+
+    def action(self, act_idx):
+        cont = np.array([self.disc2cont[int(act_idx)]], dtype=np.float32)
+        return cont                                 # original env expects np.array([γ_raw])
+
+# ----------------------------------------------------------------------
+# 3)  Reward shaping (identical to PPO training in BRACE appendix)
+# ----------------------------------------------------------------------
+# Already implemented inside DemoArbitrationEnv.step()
+# -> we can reuse it directly.
+
+# ----------------------------------------------------------------------
+# 4)  Training function
+# ----------------------------------------------------------------------
+def train_dqn(
+    total_timesteps: int = 1_000_000,
+    n_bins: int = 21,
+    save_dir: str = "dqn_gamma_out",
+):
+    save_path = pathlib.Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+
+    base_env = DemoArbitrationEnv(visualize=False)
+    env = DummyVecEnv([lambda: GammaDiscretizer(base_env, n_bins)])
+
+    policy_kwargs = dict(net_arch=[256, 256], activation_fn=torch.nn.ReLU)
+    model = DQN(
+        policy="MlpPolicy",
+        env=env,
+        learning_rate=2.5e-4,
+        buffer_size=500_000,
+        learning_starts=50_000,
+        batch_size=1024,
+        tau=0.005,
+        gamma=0.99,
+        target_update_interval=5_000,
+        exploration_fraction=0.3,
+        exploration_final_eps=0.05,
+        train_freq=(4, "step"),
+        policy_kwargs=policy_kwargs,
+        verbose=1,
+        tensorboard_log=str(save_path / "tb"),
+        seed=0,
+        device="auto",
+    )
+    model.learn(total_timesteps=total_timesteps, progress_bar=True)
+    model.save(save_path / "dqn_gamma")           # full SB3 model
+
+    # Export only the Q‑network state‑dict (smaller, easy to load)
+    torch.save(model.q_net.state_dict(), save_path / "dqn_gamma.pt")
+    print("✅  saved to", save_path.absolute())
+    env.close()
+
+# ----------------------------------------------------------------------
+# 5)  CLI
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--steps", type=int, default=1_000_000, help="training frames")
+    ap.add_argument("--bins", type=int, default=21,          help="#discrete γ bins")
+    ap.add_argument("--out",  type=str, default="dqn_gamma_out", help="output folder")
+    args = ap.parse_args()
+    train_dqn(args.steps, args.bins, args.out)
+

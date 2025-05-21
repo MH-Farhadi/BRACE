@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+# cursor_user_study.py
+# -----------------------------------------------------------
+#  8‑goal cursor‑control study with BRACE / IDA / DQN / human
+# -----------------------------------------------------------
+
+import os, math, random, time, json, datetime
+import numpy as np
+import pygame
+from pygame._sdl2.video import Window, Renderer, Texture
+
+from assist_controller import AssistanceController      # ← pretrained brains
+
+# ────────────────────────────────────────────────────────────
+#  0.  GLOBAL CONSTANTS (geometry, colours, etc.)
+# ────────────────────────────────────────────────────────────
+GAME_AREA_SIZE   = (1200, 800)
+FULL_VIEW_SIZE   = (1600, 800)
+GAME_AREA_X      = (FULL_VIEW_SIZE[0]-GAME_AREA_SIZE[0])//2
+GAME_AREA_Y      = 0
+SCALING_FACTOR   = (GAME_AREA_SIZE[0]/600 + GAME_AREA_SIZE[1]/600)/2
+DOT_RADIUS       = int(15*SCALING_FACTOR)
+TARGET_RADIUS    = int(10*SCALING_FACTOR)
+OBSTACLE_RADIUS  = int(10*SCALING_FACTOR)
+MAX_SPEED        = 3*SCALING_FACTOR
+GOAL_DET_RAD     = DOT_RADIUS+TARGET_RADIUS
+HIGH_GAMMA_TH    = 0.65
+
+WHITE =(255,255,255); BLACK =(0,0,0); RED=(255,60,60)
+GREEN =(60,180,60);   BLUE  =(60,120,255); YELLOW=(240,230,60)
+GRAY  =(128,128,128); BGCLR =(250,240,210)
+
+SCENARIO_SEEDS = [0,2,58]
+gamma_modes    = [0.0, 0.5, 1.0, "manual", "ai"]   # human, IDA, DQN, manual, BRACE
+
+pygame.init(); pygame.joystick.init()
+font  = pygame.font.Font(None,int(18*SCALING_FACTOR))
+START = np.array([GAME_AREA_X+GAME_AREA_SIZE[0]//2,
+                  GAME_AREA_Y+GAME_AREA_SIZE[1]//2],dtype=np.float32)
+
+# ‑‑‑ PyGame windows
+win_full = Window("Cursor Study ‑ full", size=FULL_VIEW_SIZE)
+ren_full = Renderer(win_full, vsync=True)
+
+# ────────────────────────────────────────────────────────────
+#  1.  ASSISTANCE CONTROLLER (Bayes + γ heads)
+# ────────────────────────────────────────────────────────────
+ctrl   = AssistanceController()
+belief = None                              # updated every frame
+
+# ────────────────────────────────────────────────────────────
+#  2.  ENVIRONMENT STATE
+# ────────────────────────────────────────────────────────────
+dot_pos  = START.copy()
+targets   = []
+obstacles = []
+current_target_idx = 0
+expected_goal_idx  = 0
+gamma = 0.0
+
+def distance(a,b): return math.hypot(a[0]-b[0], a[1]-b[1])
+
+def compute_w(dir_goal):
+    """potential‑field direction"""
+    gx,gy = dir_goal
+    mag=math.hypot(gx,gy);   return (gx/mag, gy/mag) if mag>1e-6 else (0,0)
+
+# ────────────────────────────────────────────────────────────
+#  3.  INITIALISE SCENE (goals & obstacles)
+# ────────────────────────────────────────────────────────────
+def init_scene(seed):
+    global targets, obstacles, expected_goal_idx
+    random.seed(seed); np.random.seed(seed)
+    targets=[]; obstacles=[]
+    radius=250*SCALING_FACTOR
+    cx,cy = START
+    for th in np.linspace(0,2*math.pi,9)[:-1]:
+        targets.append(np.array([cx+radius*math.cos(th),
+                                 cy+radius*math.sin(th)],dtype=np.float32))
+    # 5 random obstacles
+    for _ in range(5):
+        obstacles.append(np.array([random.uniform(GAME_AREA_X+50,GAME_AREA_X+GAME_AREA_SIZE[0]-50),
+                                   random.uniform(GAME_AREA_Y+50,GAME_AREA_Y+GAME_AREA_SIZE[1]-50)],
+                                  dtype=np.float32))
+    expected_goal_idx = 0
+
+# ────────────────────────────────────────────────────────────
+#  4.  RENDER (minimal, just dot / targets)
+# ────────────────────────────────────────────────────────────
+def render():
+    surf = pygame.Surface(FULL_VIEW_SIZE); surf.fill(BGCLR)
+    # border
+    pygame.draw.rect(surf,GRAY,pygame.Rect(GAME_AREA_X,GAME_AREA_Y,
+                                           GAME_AREA_SIZE[0],GAME_AREA_SIZE[1]),1)
+    # obstacles
+    for o in obstacles: pygame.draw.circle(surf,GRAY,o.astype(int),OBSTACLE_RADIUS)
+    # goals
+    for i,g in enumerate(targets):
+        clr = GREEN if i==expected_goal_idx else YELLOW
+        pygame.draw.circle(surf,clr,g.astype(int),TARGET_RADIUS)
+    # dot
+    pygame.draw.circle(surf,BLACK,dot_pos.astype(int),DOT_RADIUS,2)
+    # gamma bar
+    pygame.draw.rect(surf,GRAY,(10,10,150,20))
+    pygame.draw.rect(surf,RED,(10,10,int(150*gamma),20))
+    # blit
+    tex=Texture.from_surface(ren_full,surf)
+    ren_full.clear(); tex.draw(dstrect=(0,0,*FULL_VIEW_SIZE)); ren_full.present()
+
+# ────────────────────────────────────────────────────────────
+#  5.  ONE SIMULATION STEP
+# ────────────────────────────────────────────────────────────
+def step(human_vec):
+    global dot_pos, gamma, belief, current_target_idx
+    # --- belief update & choose current target
+    belief, current_target_idx = ctrl.update_belief(dot_pos, human_vec, belief)
+    target = targets[current_target_idx]
+
+    # --- gamma selection
+    obs10 = np.concatenate([dot_pos,
+                            human_vec/ (np.linalg.norm(human_vec)+1e-8),
+                            target,
+                            compute_w(target-dot_pos),
+                            [distance(dot_pos,target)/800],
+                            [1.0]])
+    mode = current_gamma_mode
+    if mode==0.0: gamma_val=0.0
+    elif mode==0.5: gamma_val=ctrl.gamma_value("ida",  obs10, belief)
+    elif mode==1.0: gamma_val=ctrl.gamma_value("dqn",  obs10, belief)
+    elif mode=="ai":gamma_val=ctrl.gamma_value("brace",obs10, belief)
+    else:           gamma_val=gamma             # manual unchanged
+    gamma=gamma_val
+
+    # --- blend movement
+    w_dir = np.array(compute_w(target-dot_pos))
+    h_dir = human_vec/(np.linalg.norm(human_vec)+1e-8)
+    move  = gamma*w_dir + (1-gamma)*h_dir
+    move  /= np.linalg.norm(move)+1e-8
+    dot_pos[:] = np.clip(dot_pos + move*MAX_SPEED,
+                         [GAME_AREA_X,GAME_AREA_Y],
+                         [GAME_AREA_X+GAME_AREA_SIZE[0], GAME_AREA_Y+GAME_AREA_SIZE[1]])
+
+# ────────────────────────────────────────────────────────────
+#  6.  MAIN LOOP
+# ────────────────────────────────────────────────────────────
+clock=pygame.time.Clock()
+for gamma_idx,current_gamma_mode in enumerate(gamma_modes):
+    for seed in SCENARIO_SEEDS:
+        init_scene(seed)
+        dot_pos[:] = START; belief=None; gamma=0.0
+        running=True; t0=time.time()
+        while running:
+            for e in pygame.event.get():
+                if e.type==pygame.QUIT: running=False
+            keys=pygame.key.get_pressed()
+            hv = np.array([keys[pygame.K_RIGHT]-keys[pygame.K_LEFT],
+                           keys[pygame.K_DOWN]-keys[pygame.K_UP]],
+                           dtype=np.float32)
+            if np.linalg.norm(hv)<1e-3: hv=np.zeros(2,dtype=np.float32)
+            step(hv)
+            render()
+            if distance(dot_pos, targets[expected_goal_idx])<GOAL_DET_RAD:
+                expected_goal_idx=(expected_goal_idx+1)%len(targets)
+            if time.time()-t0>30: running=False
+            clock.tick(60)
+
+pygame.quit()
+

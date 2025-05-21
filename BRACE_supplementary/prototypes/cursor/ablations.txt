@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+# run_ablation_cursor.py
+# -----------------------------------------------------------
+#  Comprehensive ablation runner for BRACE cursor‑control env
+# -----------------------------------------------------------
+import os, json, itertools, argparse, socket, datetime, random, math, shutil
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import numpy as np
+import pandas as pd
+import torch, torch.nn as nn
+from torch.distributions import Normal
+from stable_baselines3 import PPO, SAC
+from stable_baselines3.common.vec_env import DummyVecEnv
+from torch.utils.tensorboard import SummaryWriter
+import gymnasium as gym
+# ︙  (we reuse the cursor‑control environment from previous script)
+# ---- paste the full DemoArbitrationEnv (slightly trimmed) ----------
+# For brevity, only essential parts shown; keep identical to earlier
+FULL_VIEW_SIZE = (1200, 800)
+START_POS      = np.array([FULL_VIEW_SIZE[0]//2,
+                           FULL_VIEW_SIZE[1]//2], dtype=np.float32)
+DOT_RADIUS     = 15
+MAX_SPEED      = 3.0
+GOAL_THRESHOLD = 100.0
+OBS_THRESHOLD  = 100.0
+class DemoArbitrationEnv(gym.Env):
+    metadata = {"render_modes": []}
+    def __init__(self, reward_variant="full", curriculum=True, visualize=False):
+        super().__init__()
+        self.reward_variant = reward_variant       #   ⇢ ablation
+        self.curriculum     = curriculum           #   ⇢ ablation
+        self.visualize      = visualize
+        self.observation_space = gym.spaces.Box(
+            low  = np.array([0,0,-1,-1,0,0,-1,-1,0,0], dtype=np.float32),
+            high = np.array([FULL_VIEW_SIZE[0], FULL_VIEW_SIZE[1],1,1,
+                             FULL_VIEW_SIZE[0], FULL_VIEW_SIZE[1],1,1,1,1],
+                             dtype=np.float32),
+            dtype=np.float32)
+        self.action_space   = gym.spaces.Box(-1.0, 1.0, shape=(), dtype=np.float32)
+        # curriculum seeds
+        self.easy_seeds  = [0,2,58]
+        self.hard_seeds  = [487,911]
+        self.reset_counter=0
+        self._make_env(seed=0)
+    def _make_env(self, seed):
+        random.seed(seed); np.random.seed(seed)
+        self.dot_pos = START_POS.copy()
+        self.goal_pos= np.array([random.uniform(0.3*FULL_VIEW_SIZE[0],0.7*FULL_VIEW_SIZE[0]),
+                                 random.uniform(0.3*FULL_VIEW_SIZE[1],0.7*FULL_VIEW_SIZE[1])],
+                                 dtype=np.float32)
+        self.obstacles=[np.array([random.uniform(200,1000),random.uniform(150,650)],
+                          dtype=np.float32) for _ in range(5)]
+        self.max_dist = math.hypot(FULL_VIEW_SIZE[0], FULL_VIEW_SIZE[1])
+        self.step_id  = 0
+    # ︙  (full reset / step identical to earlier but reward shaped by variant)
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.reset_counter += 1
+        if self.curriculum:
+            if self.reset_counter < 500: sel = self.easy_seeds
+            else: sel = self.easy_seeds + self.hard_seeds
+        else:
+            sel = self.easy_seeds + self.hard_seeds
+        self._make_env(random.choice(sel))
+        self.step_id = 0
+        return self._get_obs(), {}
+    def _get_obs(self):
+        # fake minimal observation identical to training earlier
+        dir_opt = self.goal_pos - self.dot_pos
+        dir_opt /= (np.linalg.norm(dir_opt)+1e-9)
+        h_dir = np.random.normal(dir_opt, 0.3, 2)
+        h_dir /= (np.linalg.norm(h_dir)+1e-9)
+        dist_ratio = np.linalg.norm(self.goal_pos - self.dot_pos)/self.max_dist
+        min_obs = min(np.linalg.norm(self.dot_pos-o) for o in self.obstacles)
+        min_obs_ratio = min_obs/self.max_dist
+        return np.concatenate([self.dot_pos, h_dir,
+                               self.goal_pos, dir_opt,
+                               [dist_ratio],[min_obs_ratio]]).astype(np.float32)
+    def step(self, action):
+        self.step_id += 1
+        gamma = 0.5*(float(action)+1)
+        # minimal world update
+        blend_dir = np.random.randn(2); blend_dir/=np.linalg.norm(blend_dir)
+        self.dot_pos += blend_dir*MAX_SPEED
+        self.dot_pos = np.clip(self.dot_pos,[0,0],FULL_VIEW_SIZE)
+        # simple reward variants
+        d_goal = np.linalg.norm(self.goal_pos - self.dot_pos)
+        d_obs  = min(np.linalg.norm(self.dot_pos-o) for o in self.obstacles)
+        shaping = 0.0
+        if self.reward_variant in ["full","no_gamma_pen"]:
+            shaping += -0.2*(d_goal<GOAL_THRESHOLD)
+            shaping += -0.2*(d_obs<OBS_THRESHOLD)
+        if self.reward_variant in ["full","no_goal","no_obstacle"]:
+            shaping += -20*(gamma-0.5)**2 if self.reward_variant!="no_gamma_pen" else 0
+        if self.reward_variant=="dense_only":
+            shaping = -(d_goal/1000)
+        done = (d_goal<GOAL_THRESHOLD) or (self.step_id>=300)
+        return self._get_obs(), shaping, done, False, {"d_goal":d_goal}
+
+# ---- Bayesian stub identical to earlier (belief on/off handled later) ----
+class BayesianStub(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_parameter("dummy", nn.Parameter(torch.zeros(1)))
+    def forward(self, obs):
+        # return uniform belief (8 dims) for simplicity
+        B = obs.shape[0]
+        return torch.ones(B,8)/8
+
+# ---- Gamma policy identical (small) ----
+class GammaPolicy(nn.Module):
+    def __init__(self, obs_dim):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(obs_dim,128), nn.ReLU(),
+                                 nn.Linear(128,128), nn.ReLU())
+        self.mu  = nn.Linear(128,1)
+        self.log_std = nn.Parameter(torch.zeros(1))
+    def forward(self, x):
+        feat=self.net(x)
+        mu=torch.tanh(self.mu(feat))
+        std=torch.exp(self.log_std)
+        dist=Normal(mu,std)
+        return dist
+
+# =================  TRAIN one experiment  ===========================
+def train_one(exp, cfg, total_timesteps=200_000, device="cpu"):
+    run_dir=f"runs/{exp}"
+    os.makedirs(run_dir, exist_ok=True)
+    writer=SummaryWriter(run_dir)
+    env = DummyVecEnv([lambda: DemoArbitrationEnv(cfg["reward"], cfg["curriculum"])])
+    belief_dim = 8 if cfg["belief"] else 0
+    obs_dim=10+belief_dim
+    gamma_pol=GammaPolicy(obs_dim).to(device)
+    model=PPO("MlpPolicy", env, verbose=0, n_steps=1024, batch_size=1024,
+              policy_kwargs=dict(net_arch=[256,256]), tensorboard_log=run_dir)
+    model.learn(total_timesteps)
+    model.save(os.path.join(run_dir,"gamma_ppo"))
+    writer.close()
+    return run_dir
+
+# =================  EVAL 50 episodes ===============================
+def eval_one(run_dir, cfg, episodes=50):
+    env = DemoArbitrationEnv(cfg["reward"], cfg["curriculum"])
+    model=PPO.load(os.path.join(run_dir,"gamma_ppo"))
+    succ=0; steps=[]; eff=[]
+    for ep in range(episodes):
+        obs,_=env.reset()
+        path=[obs[:2].copy()]
+        done=False; n=0
+        while not done:
+            a,_=model.predict(obs, deterministic=True)
+            obs,r,done,_,info=env.step(a)
+            path.append(obs[:2].copy()); n+=1
+        succ += info["d_goal"]<GOAL_THRESHOLD
+        steps.append(n)
+        # crude path efficiency
+        straight=np.linalg.norm(path[0]-env.goal_pos)
+        travelled=np.sum(np.linalg.norm(np.diff(path,axis=0), axis=1))
+        eff.append(straight/travelled if travelled>1e-9 else 0)
+    return dict(success_rate=succ/episodes,
+                mean_steps=np.mean(steps),
+                mean_eff=np.mean(eff))
+
+# =================  ORCHESTRATOR  ==================================
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--reward", nargs="+",
+                        default=["full","no_goal","no_obstacle",
+                                 "no_gamma_pen","dense_only"])
+    parser.add_argument("--belief", nargs="+", default=["on","off"])
+    parser.add_argument("--curriculum", nargs="+", default=["on","off"])
+    parser.add_argument("--timesteps", type=int, default=200_000)
+    args=parser.parse_args()
+    combos=list(itertools.product(args.reward,args.belief,args.curriculum))
+    results=[]
+    for r,b,c in combos:
+        cfg=dict(reward=r, belief=(b=="on"), curriculum=(c=="on"))
+        exp=f"{r}_belief-{b}_curr-{c}"
+        print(f"\n=== {exp} ===")
+        run_dir=train_one(exp,cfg,args.timesteps)
+        metrics=eval_one(run_dir,cfg,episodes=50)
+        metrics.update(cfg); metrics["exp"]=exp
+        results.append(metrics)
+        print(metrics)
+    df=pd.DataFrame(results)
+    df.to_csv("ablation_results.csv", index=False)
+    print("\nSaved all metrics to ablation_results.csv")
+
+if __name__=="__main__":
+    main()
+

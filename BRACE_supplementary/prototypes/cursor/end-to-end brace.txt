@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+# train_brace_integrated.py
+# -----------------------------------------------------------
+#  End‑to‑end BRACE training:   Bayesian ⇆ γ‑actor‑critic
+#  Implements Algorithm 1 (paper §3.1 + Appendix B.1)
+# -----------------------------------------------------------
+import os, math, random, argparse, collections, itertools, time
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import numpy as np
+import torch, torch.nn as nn, torch.optim as optim
+from torch.distributions import Normal, Categorical
+
+from stable_baselines3 import SAC            # to load expert
+from gymnasium import spaces
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+FULL   = torch.tensor([1200., 800.], device=DEVICE)
+MAX_SPEED = 5.0
+DOT_R, OBS_R, TGT_R = 14., 10., 9.
+
+# ===========================================================
+#  1.  Utility geometry / helpers
+# ===========================================================
+def distance(a, b): return torch.linalg.norm(a-b, ord=2, dim=-1)
+
+def potential_field_dir(p, g, obstacles):
+    """differentiable potential‑field direction"""
+    att = (g-p); att = att/ (att.norm(dim=-1, keepdim=True)+1e-8)
+    rep = torch.zeros_like(att)
+    REP_RAD, REP_GAIN = 90., 3e4
+    d = g-p            # dummy to keep shape
+    for o in obstacles:           # obstacles is Tensor[K,2]
+        d = p-o
+        dn = d.norm(dim=-1, keepdim=True)+1e-9
+        mask = (dn < REP_RAD).float()
+        rep += mask * (d/dn) * (REP_GAIN/(dn**2))
+    v = att + rep
+    v = v/(v.norm(dim=-1, keepdim=True)+1e-8)
+    return v
+
+# ===========================================================
+#  2.  Bayesian goal‑inference module  (learnable)
+# ===========================================================
+class BayesianIntent(nn.Module):
+    """
+    Implements Eqs.(1)–(3).  Parameters to *learn*:
+        beta, wθ, wd   (all constrained positive via softplus)
+    Return:
+        belief          (batch × n_goals)
+        logp_step       scalar ‑log p(h_t|x_t;θ)  needed for REINFORCE
+    """
+    def __init__(self, goals):
+        super().__init__()
+        self.register_buffer("goals", goals)            # (n,2)
+        self.raw_beta   = nn.Parameter(torch.tensor(2.0))
+        self.raw_wth    = nn.Parameter(torch.tensor(0.8))
+        self.raw_wdist  = nn.Parameter(torch.tensor(0.2))
+        self.n = goals.shape[0]
+
+    def positive(self, p):           # softplus
+        return torch.nn.functional.softplus(p)
+
+    def forward(self, cursor, h_vec, prev_belief):
+        """
+        cursor, h_vec : (B,2)   prev_belief : (B,n) or None
+        """
+        B = cursor.shape[0]
+        beta  = self.positive(self.raw_beta)
+        wth   = self.positive(self.raw_wth)
+        wdist = self.positive(self.raw_wdist)
+
+        # compute angle‑ & distance‑based cost for **each goal**
+        g = self.goals.to(cursor)                           # (n,2)
+        to_g   = g[None,:,:] - cursor[:,None,:]             # B×n×2
+        opt_d  = to_g/ (to_g.norm(dim=-1, keepdim=True)+1e-8)
+        h_dir  = h_vec/ (h_vec.norm(dim=-1, keepdim=True)+1e-8)
+        ang    = torch.arccos(torch.clamp((h_dir[:,None,:]*opt_d).sum(-1), -1.,1.))   # B×n
+        # simple speed cost = |‖h‖ – ‖opt‖| / ‖opt‖ ;  here opt magnitude =1
+        dist_dev = (h_vec.norm(dim=-1, keepdim=True).expand_as(ang)-1.).abs()
+        cost   = wth*ang + wdist*dist_dev
+        log_likelihood = -beta*cost            # B×n  (unnormalised)
+        ll = torch.exp(log_likelihood - log_likelihood.max(dim=1, keepdim=True).values)
+        belief = ll if prev_belief is None else prev_belief*ll
+        belief = belief / belief.sum(dim=1, keepdim=True)
+
+        # negative log prob of current observation GIVEN each goal distribution
+        #   used later for REINFORCE   (score‑function ∇θ log p)
+        logp = torch.log((belief.detach()*ll).sum(dim=1)+1e-9)   # B
+        return belief, -logp.mean()
+
+# ===========================================================
+#  3.  γ‑Actor‑Critic  (shared trunk -> π & V)
+# ===========================================================
+class GammaActorCritic(nn.Module):
+    def __init__(self, obs_dim):
+        super().__init__()
+        hid = 256
+        self.shared = nn.Sequential(nn.Linear(obs_dim, hid),
+                                    nn.ReLU(),
+                                    nn.Linear(hid, hid),
+                                    nn.ReLU())
+        self.mu_head  = nn.Linear(hid, 1)
+        self.log_std  = nn.Parameter(torch.zeros(1))
+        self.v_head   = nn.Linear(hid, 1)
+
+    def forward(self, obs, deterministic=False):
+        feat = self.shared(obs)
+        mu   = torch.tanh(self.mu_head(feat))          # in [-1,1]
+        std  = torch.exp(self.log_std).clamp(1e-3,1.0)
+        dist = Normal(mu, std)
+        a    = mu if deterministic else torch.tanh(dist.rsample())
+        logp = dist.log_prob(a).sum(-1, keepdim=True)
+        v    = self.v_head(feat)
+        return a, logp, v
+
+# ===========================================================
+#  4.  Expert SAC  (frozen)
+# ===========================================================
+EXPERT_PATH = "expert_sac.zip"
+expert = SAC.load(EXPERT_PATH, device=DEVICE)
+expert.policy.eval()
+for p in expert.policy.parameters(): p.requires_grad_(False)
+
+# helper to get w‑action
+@torch.no_grad()
+def expert_w_action(obs_np):
+    a,_ = expert.predict(obs_np, deterministic=True)
+    return torch.tensor(a, dtype=torch.float32, device=DEVICE)
+
+# ===========================================================
+#  5.  Simulated environment (vectorised)
+# ===========================================================
+class SimWorld:
+    """
+    Vectorised batch of N parallel worlds, purely in torch to keep gradients.
+    Each world has:
+        cursor (2) , one active goal, K obstacles
+    """
+    def __init__(self, batch, n_goals=8, n_obs=4):
+        self.B = batch
+        self.n_goals = n_goals
+        self.n_obs   = n_obs
+        self.reset()
+
+    # ----------------------------------------------
+    def reset(self):
+        margin = 80.
+        self.cursor = FULL/2 + torch.zeros(self.B,2, device=DEVICE)
+        goals = []
+        for _ in range(self.B):
+            gs=[]
+            while len(gs)<self.n_goals:
+                p = torch.rand(2, device=DEVICE)* (FULL-2*margin)+margin
+                if distance(p, self.cursor[0])>260: gs.append(p)
+            goals.append(torch.stack(gs))
+        self.goals = torch.stack(goals)            # B×n×2
+        idx = torch.randint(0,self.n_goals,(self.B,), device=DEVICE)
+        self.goal_xy = self.goals[torch.arange(self.B), idx]
+        # obstacles
+        obs = []
+        for b in range(self.B):
+            oz=[]
+            for g in self.goals[b,:3]:
+                t  = torch.rand((), device=DEVICE)*0.25+0.55
+                base = self.cursor[b]+t*(g-self.cursor[b])
+                perp = torch.tensor([- (g-self.cursor[b])[1],
+                                      (g-self.cursor[b])[0]])
+                perp = perp/(torch.norm(perp)+1e-9)
+                off  = perp* (torch.rand((), device=DEVICE)*20+60)*\
+                       (1 if torch.rand(())>0.5 else -1)
+                oz.append(base+off)
+            obs.append(torch.stack(oz))
+        self.obstacles = torch.stack(obs)          # B×n_obs×2
+        self.steps = torch.zeros(self.B, device=DEVICE, dtype=torch.int32)
+        self.prev_dist_goal = distance(self.cursor, self.goal_xy)
+        self.done = torch.zeros(self.B, dtype=torch.bool, device=DEVICE)
+        return self._state_for_expert()
+
+    # ----------------------------------------------
+    def _state_for_expert(self):
+        """
+        expert expects 6‑D:  cursor(2) goal(2) d_goal_norm d_obs_norm
+        """
+        d_goal = distance(self.cursor, self.goal_xy)/torch.linalg.norm(FULL)
+        d_obs = torch.min(distance(self.cursor[:,None,:], self.obstacles),dim=2).values
+        d_obs = d_obs/torch.linalg.norm(FULL)
+        return torch.cat([self.cursor, self.goal_xy,
+                          d_goal.unsqueeze(1), d_obs.unsqueeze(1)], dim=1).detach().cpu().numpy()
+
+    # ----------------------------------------------
+    def step(self, human_vec, gamma):
+        """
+        human_vec, gamma : (B,2) , (B,1) tensors
+        returns reward, done mask
+        """
+        w_dir = potential_field_dir(self.cursor, self.goal_xy, self.obstacles)
+        blend = gamma*w_dir + (1-gamma)*human_vec
+        blend = blend/(blend.norm(dim=-1, keepdim=True)+1e-8)
+        self.cursor = torch.clip(self.cursor + blend*MAX_SPEED,
+                                 torch.zeros_like(FULL), FULL)
+
+        d_goal = distance(self.cursor, self.goal_xy)
+        d_obs  = torch.min(distance(self.cursor[:,None,:], self.obstacles),dim=2).values
+        collide = d_obs < (DOT_R+OBS_R)
+
+        # shaped reward (same as expert env but vectorised)
+        reward = -0.01 + (self.prev_dist_goal - d_goal)*0.5
+        self.prev_dist_goal = d_goal
+        reward = reward + torch.where(d_goal < 36.,  2.0, 0.0)
+        reward = reward + torch.where(collide,        -4.0, 0.0)
+
+        done = torch.logical_or(collide, d_goal<36.)
+        self.done = torch.logical_or(self.done, done)
+        self.steps += 1
+        done = torch.logical_or(done, self.steps>=400)
+        return reward.detach(), done
+
+# ===========================================================
+#  6.  Integrated training loop (Algorithm 1)
+# ===========================================================
+def train_brace(batch=64, epochs=6000, unroll=64,
+                lr_gamma=3e-4, lr_bayes=1e-3):
+    torch.manual_seed(0)
+    # one world to get goal tensor for init
+    tmp = SimWorld(1); goals_tensor = tmp.goals[0].detach().cpu()
+    bayes = BayesianIntent(goals_tensor).to(DEVICE)
+    gamma_pi = GammaActorCritic(obs_dim=2+2+1+1+bayes.n).to(DEVICE)  # cursor(2) d_goal d_obs + belief
+    optim_pi = optim.Adam(gamma_pi.parameters(), lr=lr_gamma)
+    optim_b  = optim.Adam(bayes.parameters(), lr=lr_bayes)
+
+    BUFFER = collections.deque(maxlen=1024)
+
+    world = SimWorld(batch)
+    for epoch in range(epochs):
+        world.reset()
+        bayes_belief = torch.ones(batch, bayes.n, device=DEVICE)/bayes.n
+        logp_b_list, logp_a_list, values, rewards = [],[],[],[]
+        for t in range(unroll):
+            # ---------------- simulate human noisy vec -----------------
+            w_dir = potential_field_dir(world.cursor, world.goal_xy, world.obstacles)
+            human_vec = w_dir + torch.randn_like(w_dir)*0.3
+            human_vec = human_vec/(human_vec.norm(dim=-1,keepdim=True)+1e-8)
+
+            # Bayesian update
+            bayes_belief, neglogp_h = bayes(world.cursor, human_vec, bayes_belief)
+            logp_b_list.append(-neglogp_h)                    # store +log p
+
+            # γ‑policy input
+            d_goal = distance(world.cursor, world.goal_xy)/torch.linalg.norm(FULL)
+            d_obs  = torch.min(distance(world.cursor[:,None,:], world.obstacles),dim=2).values
+            d_obs  = d_obs/torch.linalg.norm(FULL)
+            obs_pi = torch.cat([world.cursor, d_goal.unsqueeze(1), d_obs.unsqueeze(1),
+                                bayes_belief], dim=1)
+            a, logp_a, v = gamma_pi(obs_pi)
+            gamma = 0.5*(a+1.0)           # map [-1,1]→[0,1]
+
+            r, done = world.step(human_vec, gamma)
+            rewards.append(r)
+            logp_a_list.append(logp_a.squeeze(-1))
+            values.append(v.squeeze(-1))
+
+            if done.all(): break
+
+        # stack trajectory tensors   (T,B)
+        R = torch.stack(rewards)                       # T×B
+        logp_a = torch.stack(logp_a_list)
+        logp_b = torch.stack(logp_b_list)
+        V = torch.stack(values)
+        with torch.no_grad():
+            G = torch.zeros_like(R)
+            running = torch.zeros(batch, device=DEVICE)
+            for t in reversed(range(R.size(0))):
+                running = R[t] + 0.99*running
+                G[t] = running
+            Adv = (G - V).detach()
+
+        # ----------------------------------  losses
+        policy_loss = -(Adv * logp_a).mean()
+        value_loss  = 0.5*((G - V)**2).mean()
+        entropy_reg = -0.0005 * (- (logp_a+1e-9).exp()*logp_a).mean()
+        loss_pi = policy_loss + value_loss + entropy_reg
+
+        #     REINFORCE for Bayesian parameters
+        loss_b = -(Adv.detach() * logp_b).mean()
+
+        optim_pi.zero_grad()
+        loss_pi.backward()
+        optim_pi.step()
+
+        optim_b.zero_grad()
+        loss_b.backward()
+        optim_b.step()
+
+        if epoch%100==0:
+            print(f"ep {epoch:05d} | reward {R.sum(0).mean():6.2f} "
+                  f"| π_loss {loss_pi.item():6.3f} | B_loss {loss_b.item():6.3f}")
+
+    torch.save({
+        "gamma_pi": gamma_pi.state_dict(),
+        "bayes": bayes.state_dict()
+    }, "brace_integrated.pt")
+    print("✓ integrated model saved to brace_integrated.pt")
+
+# ===========================================================
+#  7.  Roll‑out viewer (deterministic policy)
+# ===========================================================
+def watch_one():
+    ckpt = torch.load("brace_integrated.pt", map_location=DEVICE)
+    tmp = SimWorld(1); goals_tensor = tmp.goals[0].detach().cpu()
+    bayes = BayesianIntent(goals_tensor).to(DEVICE)
+    gamma_pi = GammaActorCritic(obs_dim=2+2+1+1+bayes.n).to(DEVICE)
+    gamma_pi.load_state_dict(ckpt["gamma_pi"]); gamma_pi.eval()
+    bayes.load_state_dict(ckpt["bayes"]); bayes.eval()
+
+    world = SimWorld(1)
+    world.reset()
+    belief = torch.ones(1, bayes.n, device=DEVICE)/bayes.n
+    total=0.
+    for t in range(600):
+        w_dir = potential_field_dir(world.cursor, world.goal_xy, world.obstacles)
+        h_vec = w_dir                                           # no extra noise for demo
+        belief,_ = bayes(world.cursor, h_vec, belief)
+        d_goal = distance(world.cursor, world.goal_xy)/torch.linalg.norm(FULL)
+        d_obs  = torch.min(distance(world.cursor[:,None,:], world.obstacles),dim=2).values
+        d_obs  = d_obs/torch.linalg.norm(FULL)
+        obs_pi = torch.cat([world.cursor, d_goal.unsqueeze(1), d_obs.unsqueeze(1), belief], dim=1)
+        with torch.no_grad():
+            a,_,_ = gamma_pi(obs_pi, deterministic=True)
+        gamma = 0.5*(a+1.0)
+        r,_ = world.step(h_vec, gamma)
+        total += r.item()
+        if world.done[0]: break
+    print("episode return:", total)
+
+# ===========================================================
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--watch", action="store_true")
+    args = ap.parse_args()
+    if args.watch:
+        watch_one()
+    else:
+        train_brace()
+

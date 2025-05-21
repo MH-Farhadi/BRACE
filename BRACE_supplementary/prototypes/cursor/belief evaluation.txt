@@ -1,0 +1,191 @@
+"""
+brace.visualize_belief
+======================
+
+Visualisation & quantification utilities for Bayesian‑goal belief updates.
+
+USAGE
+-----
+
+# 1) From a JSON trajectory log (the format saved in your main loop)
+python -m brace.visualize_belief  path/to/data_log_*.json  --goal-id 3
+
+# 2) Programmatic use
+from brace.visualize_belief import BeliefAnalytics
+ba = BeliefAnalytics(belief_matrix, true_goal_id)
+ba.summary()
+ba.plot(save_path="belief_heatmap.png")
+"""
+
+import json, argparse, math, os, itertools, numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from pathlib import Path
+
+# ╭──────────────────────────────────────────────────────────╮
+# │  1.  Load helpers                                        │
+# ╰──────────────────────────────────────────────────────────╯
+def _load_from_json(path):
+    """
+    Expects each timestep to contain:
+      { "belief": [p1,…,pG], "goal_id": k, "t": t_float, ... }
+    """
+    items = json.load(open(path))
+    belief = np.stack([it["belief"] for it in items])      # T×G
+    goal   = items[0].get("goal_id", None)
+    return belief, goal
+
+def _moving_average(x, w):
+    if len(x) < w: return x
+    return np.convolve(x, np.ones(w)/w, mode="valid")
+
+# ╭──────────────────────────────────────────────────────────╮
+# │  2.  Core analytics class                                │
+# ╰──────────────────────────────────────────────────────────╯
+class BeliefAnalytics:
+    def __init__(self, belief, true_goal_id=None, t=None):
+        """
+        belief : ndarray (T × G)
+        true_goal_id : int or None   (if None, accuracy metrics are skipped)
+        t : optional time vector (T,) for nicer x‑axis
+        """
+        assert belief.ndim == 2, "belief should be (T,G)"
+        self.B = np.clip(belief, 1e-9, 1.0)          # avoid log 0
+        self.B /= self.B.sum(axis=1, keepdims=True)  # renormalise
+        self.G  = self.B.shape[1]
+        self.T  = self.B.shape[0]
+        self.t  = np.arange(self.T) if t is None else t
+        self.true_goal = true_goal_id
+
+    # ────────────────────────────────────────────────────────
+    #  Quantitative metrics
+    # ────────────────────────────────────────────────────────
+    def entropy(self):
+        """Shannon entropy H(b_t) in nats (T,)"""
+        return -(self.B * np.log(self.B)).sum(axis=1)
+
+    def kl_to_uniform(self):
+        """KL(b_t ‖ U) where U is uniform."""
+        unif = 1.0 / self.G
+        return (self.B * np.log(self.B / unif)).sum(axis=1)
+
+    def top1_accuracy(self):
+        if self.true_goal is None:
+            return None
+        top1 = np.argmax(self.B, axis=1)
+        return (top1 == self.true_goal).astype(float)
+
+    def auc_convergence(self):
+        """
+        Area‑under‑curve of the probability mass on the true goal
+        – a rough “speed × confidence” metric.
+        """
+        if self.true_goal is None:
+            return None
+        return np.trapz(self.B[:, self.true_goal], x=self.t)
+
+    # ────────────────────────────────────────────────────────
+    #  Convenience summary
+    # ────────────────────────────────────────────────────────
+    def summary(self, window=15):
+        H   = self.entropy()
+        KL  = self.kl_to_uniform()
+        acc = self.top1_accuracy()
+        print("──────────────── Belief update summary ────────────────")
+        print(f"T timesteps : {self.T}")
+        print(f"Goals       : {self.G}")
+        print(f"Entropy  ↓  : final {H[-1]:.3f}  (start {H[0]:.3f})")
+        print(f"KL→Uniform ↑: final {KL[-1]:.3f} (start {KL[0]:.3f})")
+        if acc is not None:
+            print(f"Top‑1 Acc   : {acc.mean()*100:.1f}%")
+            print(f"AUC mass on true goal: {self.auc_convergence():.3f}")
+        print("Moving‑avg entropy (window=%d): %.3f → %.3f"
+              % (window, _moving_average(H, window)[0], _moving_average(H, window)[-1]))
+        print("────────────────────────────────────────────────────────")
+
+    # ────────────────────────────────────────────────────────
+    #  Plot utilities
+    # ────────────────────────────────────────────────────────
+    def plot(self, save_path=None, show=True, figsize=(10,5)):
+        plt.figure(figsize=figsize)
+        # 1) belief heat‑map
+        plt.subplot(121)
+        plt.imshow(self.B.T, aspect="auto", origin="lower",
+                   extent=[self.t[0], self.t[-1], 0.5, self.G+0.5],
+                   cmap="viridis")
+        plt.colorbar(label="p(goal g)")
+        plt.yticks(range(1, self.G+1))
+        plt.xlabel("time‑step")
+        plt.ylabel("goal id")
+        plt.title("Belief heat‑map")
+        # mark true goal if known
+        if self.true_goal is not None:
+            plt.axhline(self.true_goal+1, color="red", lw=1, ls="--")
+
+        # 2) entropy / KL / prob(true)
+        plt.subplot(122)
+        t   = self.t
+        H   = self.entropy()
+        KL  = self.kl_to_uniform()
+        plt.plot(t, H, label="entropy H(bₜ)")
+        plt.plot(t, KL, label="KL(bₜ‖U)")
+        if self.true_goal is not None:
+            plt.plot(t, self.B[:, self.true_goal],
+                     label="p(true goal)", alpha=0.7)
+        plt.xlabel("time‑step")
+        plt.legend()
+        plt.title("Confidence metrics")
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=150)
+        if show:
+            plt.show()
+        plt.close()
+
+# ╭──────────────────────────────────────────────────────────╮
+# │  3.  CLI                                                 │
+# ╰──────────────────────────────────────────────────────────╯
+def _cli():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("logfiles", nargs="+",
+                    help="JSON files produced by the experiment loop "
+                         "OR numpy .npz with 'belief' & 'goal_id'")
+    ap.add_argument("--goal-id", type=int, default=None,
+                    help="Override true goal id (if not in file).")
+    ap.add_argument("--save-dir", default="belief_plots",
+                    help="Directory to dump PNGs and CSV.")
+    args = ap.parse_args()
+
+    os.makedirs(args.save_dir, exist_ok=True)
+    rows = []
+    for fp in args.logfiles:
+        path = Path(fp)
+        if path.suffix == ".json":
+            B, g = _load_from_json(path)
+        else:          # try npz
+            dat = np.load(path)
+            B = dat["belief"]
+            g = int(dat["goal_id"])
+        if args.goal_id is not None:
+            g = args.goal_id
+        ba = BeliefAnalytics(B, g)
+        ba.summary()
+        out_png = Path(args.save_dir) / f"{path.stem}_belief.png"
+        ba.plot(save_path=out_png, show=False)
+        rows.append({
+            "file": path.name,
+            "auc_true_goal": ba.auc_convergence(),
+            "final_entropy": ba.entropy()[-1],
+            "mean_top1_acc": None if ba.top1_accuracy() is None
+                               else ba.top1_accuracy().mean()
+        })
+    if rows:
+        df = pd.DataFrame(rows)
+        out_csv = Path(args.save_dir) / "belief_metrics.csv"
+        df.to_csv(out_csv, index=False)
+        print("Saved per‑file metrics to", out_csv)
+
+if __name__ == "__main__":
+    _cli()
+

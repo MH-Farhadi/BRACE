@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""
+Train a Bayesian goal‑inference module à la BRACE.
+Requires:  numpy, torch  (≈ 50 lines of PyTorch total).
+"""
+
+import json, glob, math, numpy as np, torch
+from torch import nn, optim
+from pathlib import Path
+
+# ----------------------------
+#  Helper geometry functions
+# ----------------------------
+def unit(v):
+    n = np.linalg.norm(v)
+    return v / (n + 1e-9)
+
+def angle_between(a, b):
+    a_u, b_u = unit(a), unit(b)
+    dot = np.clip((a_u * b_u).sum(), -1.0, 1.0)
+    return np.arccos(dot)
+
+# ----------------------------
+#  Bayesian filter module
+# ----------------------------
+class BayesianGoalInference(nn.Module):
+    def __init__(self, n_goals, device='cpu'):
+        super().__init__()
+        # raw learnable parameters (positive by softplus)
+        self.raw_beta   = nn.Parameter(torch.tensor(2.0))
+        self.raw_wth    = nn.Parameter(torch.tensor(0.8))
+        self.raw_wdist  = nn.Parameter(torch.tensor(0.2))
+        self.n_goals    = n_goals
+        self.device     = device
+
+    # convenient positive transforms
+    def beta(self):   return torch.nn.functional.softplus(self.raw_beta)
+    def wth(self):    return torch.nn.functional.softplus(self.raw_wth)
+    def wdist(self):  return torch.nn.functional.softplus(self.raw_wdist)
+
+    def step_likelihood(self, hx, hy, x, y, goals):
+        """
+        hx,hy : human input vector  (batch × 2)
+        x,y   : current cursor pos   (batch × 2)
+        goals : tensor (n_goals × 2)
+        returns: likelihood  (batch × n_goals)
+        """
+        H = torch.stack([hx, hy], dim=-1)                      # B×2
+        P = torch.stack([x,  y ], dim=-1)                      # B×2
+        G = goals.to(self.device)                              # n×2
+        vec_to_g   = G[None,:,:] - P[:,None,:]                 # B×n×2
+        opt_dir    = vec_to_g / (vec_to_g.norm(dim=-1, keepdim=True)+1e-8)
+        h_dir      = H / (H.norm(dim=-1, keepdim=True)+1e-8)
+        ang_dev    = torch.arccos(torch.clamp((h_dir[:,None,:]*opt_dir).sum(-1),
+                                              -1.0, 1.0))      # B×n
+        dist_dev   = (H.norm(dim=-1, keepdim=True)+1e-8) / \
+                     (opt_dir.norm(dim=-1)+1e-8) - 1.0         # B×n
+        cost = self.wth()*ang_dev.abs() + self.wdist()*dist_dev.abs()
+        ll   = (-self.beta()*cost).exp()                       # likelihood
+        return ll
+
+# ----------------------------
+#  Training loop
+# ----------------------------
+def load_dataset(folder):
+    """Returns list of trajectories; each is (T, 6): x,y,hx,hy,goal_id"""
+    trajs = []
+    for path in glob.glob(str(Path(folder)/"*.json")):
+        data = json.load(open(path))
+        traj = [(d["x"], d["y"], d["hx"], d["hy"], d["goal_id"]) for d in data]
+        trajs.append(np.array(traj, dtype=np.float32))
+    return trajs
+
+def train(folder, goal_positions, epochs=20, lr=5e-3, device='cpu'):
+    trajs = load_dataset(folder)
+    n_goals = len(goal_positions)
+    goals_t = torch.tensor(goal_positions, dtype=torch.float32)
+    model   = BayesianGoalInference(n_goals, device).to(device)
+    opt     = optim.Adam(model.parameters(), lr=lr)
+
+    for ep in range(epochs):
+        total_nll = 0.0
+        for traj in trajs:
+            opt.zero_grad()
+            # uniform prior
+            beliefs = torch.ones(n_goals, device=device)/n_goals
+            nll = 0.0
+            for step in traj:
+                x,y,hx,hy,goal = step
+                x = torch.tensor([x], device=device)
+                y = torch.tensor([y], device=device)
+                hx= torch.tensor([hx],device=device)
+                hy= torch.tensor([hy],device=device)
+                ll = model.step_likelihood(hx,hy,x,y, goals_t) # 1×n
+                beliefs = beliefs*ll.squeeze(0)
+                beliefs = beliefs / beliefs.sum()              # normalise
+                nll += -torch.log(beliefs[goal]+1e-9)          # −log p(true goal)
+            nll.backward()
+            opt.step()
+            total_nll += nll.item()
+        print(f"epoch {ep:02d}  mean NLL per traj = {total_nll/len(trajs):.3f}")
+    torch.save(model.state_dict(), "bayes_goal_inference.pt")
+    print("✓ model saved to bayes_goal_inference.pt")
+
+if __name__ == "__main__":
+    # Example goal positions (replace with your real task goals)
+    GOALS = [(200,200),(600,150),(350,500),(800,400)]
+    train(folder="demo_dataset", goal_positions=GOALS)
+

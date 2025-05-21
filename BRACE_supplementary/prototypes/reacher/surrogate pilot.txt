@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+# noisy_surrogate_pilot_reacher.py
+# -----------------------------------------------------------
+#  Surrogate‑human pilot = expert SAC   +  OU / Gaussian noise
+#
+#  • Runs in Reacher‑v4                 ( --run            )
+#  • Logs episodes to JSON              ( --record <file>  )
+#  • CLI parameters let you dial noise (σ, θ, dt) on the fly
+# -----------------------------------------------------------
+import os, argparse, json, time, math, collections, random, pathlib
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import numpy as np
+import torch
+import gymnasium as gym
+from stable_baselines3 import SAC
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ╭──────────────────────────────────────────────────────────╮
+# │ 1.  Ornstein‑Uhlenbeck noise utility                     │
+# ╰──────────────────────────────────────────────────────────╯
+class OUNoise:
+    def __init__(self, size:int, mu=0.0, theta=0.15, sigma=0.2, dt=1/50):
+        self.size, self.mu, self.theta, self.sigma, self.dt = size, mu, theta, sigma, dt
+        self.reset()
+    def reset(self):
+        self.state = np.ones(self.size)*self.mu
+    def __call__(self):
+        x = self.state
+        dx = self.theta*(self.mu - x)*self.dt + self.sigma*np.sqrt(self.dt)*np.random.randn(self.size)
+        self.state = x + dx
+        return self.state
+
+# ╭──────────────────────────────────────────────────────────╮
+# │ 2.  Surrogate pilot wrapper                              │
+# ╰──────────────────────────────────────────────────────────╯
+class SurrogatePilot:
+    def __init__(self, expert_path:str,
+                 noise_type:str="ou", sigma:float=0.2,
+                 ou_theta:float=0.15, ou_dt:float=1/50):
+        self.expert = SAC.load(expert_path, device=DEVICE)
+        self.noise_type = noise_type
+        self.sigma = sigma
+        if noise_type=="ou":
+            self.noise = OUNoise(2, sigma=sigma, theta=ou_theta, dt=ou_dt)
+        else:
+            self.noise = None   # will sample iid Gaussian every call
+
+    def act(self, obs:np.ndarray, deterministic=True):
+        expert_act, _ = self.expert.predict(obs, deterministic=deterministic)
+        if self.noise_type == "ou":
+            noisy = expert_act + self.noise()
+        else:                                      # iid Gaussian
+            noisy = expert_act + np.random.normal(0, self.sigma, size=expert_act.shape)
+        return np.clip(noisy, -1.0, 1.0), expert_act
+
+    def reset(self):
+        if self.noise_type=="ou": self.noise.reset()
+
+# ╭──────────────────────────────────────────────────────────╮
+# │ 3.  JSON recording helper                                │
+# ╰──────────────────────────────────────────────────────────╯
+def save_episode(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+# ╭──────────────────────────────────────────────────────────╮
+# │ 4.  Main routine                                         │
+# ╰──────────────────────────────────────────────────────────╯
+def main(args):
+    env = gym.make("Reacher-v4", render_mode=("human" if args.render else None))
+    pilot = SurrogatePilot(args.expert, args.noise, args.sigma,
+                           ou_theta=args.ou_theta, ou_dt=args.ou_dt)
+
+    all_logs = []
+    for ep in range(args.episodes):
+        obs,_   = env.reset(seed=ep)
+        pilot.reset()
+        ep_log  = {"frames":[]}
+        done = trunc = False
+        ep_ret = 0.0
+        while not(done or trunc):
+            act, exp_act = pilot.act(obs, deterministic=True)
+            nobs, r, done, trunc, _ = env.step(act)
+            ep_ret += r
+            if args.record:
+                ep_log["frames"].append({
+                    "t": time.time(),
+                    "obs": obs.tolist(),
+                    "pilot_act": act.tolist(),
+                    "expert_act": exp_act.tolist(),
+                    "reward": float(r)
+                })
+            obs = nobs
+        if args.record:
+            ep_log["return"] = ep_ret
+            all_logs.append(ep_log)
+            print(f"episode {ep:03d}  return {ep_ret:6.2f}  len {len(ep_log['frames'])}")
+    env.close()
+
+    if args.record:
+        pathlib.Path(args.record).parent.mkdir(parents=True, exist_ok=True)
+        save_episode(args.record, all_logs)
+        print("✓ saved episodes to", args.record)
+
+# ╭──────────────────────────────────────────────────────────╮
+# │ 5.  CLI                                                  │
+# ╰──────────────────────────────────────────────────────────╯
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--expert", default="expert_reacher.zip",
+                    help="path to pretrained expert SAC weights")
+    ap.add_argument("--episodes", type=int, default=20)
+    ap.add_argument("--noise", choices=["ou", "gauss"], default="ou",
+                    help="'ou' = Ornstein–Uhlenbeck,  'gauss' = iid Gaussian")
+    ap.add_argument("--sigma", type=float, default=0.2,
+                    help="std‑dev of noise")
+    ap.add_argument("--ou-theta", type=float, default=0.15,
+                    help="θ parameter for OU")
+    ap.add_argument("--ou-dt", type=float, default=0.02,
+                    help="dt step for OU")
+    ap.add_argument("--render", action="store_true",
+                    help="visualise in MuJoCo viewer")
+    ap.add_argument("--record", metavar="FILE.json",
+                    help="save a list of episode dicts as JSON")
+    args = ap.parse_args()
+    main(args)
+

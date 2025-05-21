@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+train_ida.py  –  Pre‑trains the IDA‑controlled ‘gamma mode’ for the cursor‑control environment
+=============================================================================================
+Steps
+-----
+1.  Train a soft‑actor‑critic (SAC) expert that **fully observes** the goal (Algorithm 1, line 3 of the
+    NeurIPS‑24 IDA paper ‹Shared Autonomy with IDA› :contentReference[oaicite:0]{index=0}).
+
+2.  Roll out the expert for N transitions, **mask the goal**, and write a replay buffer
+    D = {(s̃, aᴱ)} – these are goal‑agnostic demonstrations (§ 3.3 in the paper).
+
+3.  Train a *denoising‑diffusion* copilot π_c(a_c | s̃, a_p, t) on D to imitate expert actions
+    from *noised* inputs (equation 2).
+
+4.  Export the expert’s *Q*‑critic as a standalone Torch module; at run‑time we compute
+    the copilot‑advantage   
+        A(s̃, a_c, a_p) = sign(Q(s̃, a_c) − Q(s̃, a_p))                (eqs. 5–8)  
+    and set  
+        γ_IDA = 1  if A == +1   else 0              # binary intervention
+
+No hyper‑parameter γ needs tuning – the intervention function
+guarantees J(π_IDA) ≥ max(J(π_pilot), J(π_copilot)) (Theorem 1).
+
+Dependencies
+------------
+- gymnasium               >= 0.29
+- stable‑baselines3       >= 2.2    (SAC implementation)
+- torch                   >= 2.1
+"""
+
+from __future__ import annotations
+import argparse, os, json, time, math, random, pathlib, copy, pickle
+from typing import Tuple
+
+import gymnasium as gym
+from stable_baselines3 import SAC
+from stable_baselines3.common.buffers import ReplayBuffer
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import BaseCallback
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+
+# -----------------------------------------------------------------------------
+# 1)  CURSOR‑CONTROL ENV  (imported from your previous code)
+# -----------------------------------------------------------------------------
+from demo_arbitration_env import DemoArbitrationEnv          # <- make sure this is importable
+
+# -----------------------------------------------------------------------------
+# 2)  EXPERT (SAC) TRAINING
+# -----------------------------------------------------------------------------
+def train_expert(
+        total_steps: int = 3_000_000,
+        seed: int = 0,
+        save_dir: str = "ida_outputs/expert",
+) -> SAC:
+    os.makedirs(save_dir, exist_ok=True)
+    env = DummyVecEnv([lambda: DemoArbitrationEnv(visualize=False)])
+    model = SAC(
+        "MlpPolicy",
+        env,
+        learning_rate=3e-4,
+        tau=0.005,
+        gamma=0.99,
+        buffer_size=1_000_000,
+        batch_size=512,
+        policy_kwargs=dict(net_arch=[256, 256, 256]),
+        verbose=1,
+        seed=seed,
+        device="auto",
+    )
+    model.learn(total_timesteps=total_steps, progress_bar=True)
+    model.save(os.path.join(save_dir, "sac_expert"))
+    # also save just the Q‑functions for inference‑time advantage
+    torch.save(
+        {
+            "critic1": model.critic.qf1.state_dict(),
+            "critic2": model.critic.qf2.state_dict(),
+            "obs_norm": copy.deepcopy(model.policy.actor).state_dict(),  # reuse normaliser
+        },
+        os.path.join(save_dir, "q_heads.pt"),
+    )
+    env.close()
+    return model
+
+# -----------------------------------------------------------------------------
+# 3)  COLLECT GOAL‑MASKED DEMONSTRATIONS
+# -----------------------------------------------------------------------------
+def collect_demonstrations(
+        model: SAC,
+        n_transitions: int = 1_000_000,
+        save_dir: str = "ida_outputs/demos",
+) -> str:
+    os.makedirs(save_dir, exist_ok=True)
+    env = DemoArbitrationEnv(visualize=False)
+    # we only store goal‑agnostic obs; the env’s _get_obs already outputs s̃
+    states, acts = [], []
+    obs, _ = env.reset()
+    for _ in range(n_transitions):
+        action, _ = model.predict(obs, deterministic=True)
+        states.append(obs.copy())
+        acts.append(action.copy())
+        obs, _, term, trunc, _ = env.step(action)
+        if term or trunc:
+            obs, _ = env.reset()
+    arr_s = np.stack(states).astype(np.float32)
+    arr_a = np.stack(acts).astype(np.float32)
+    np.savez_compressed(os.path.join(save_dir, "expert_demos.npz"), s=arr_s, a=arr_a)
+    env.close()
+    return os.path.join(save_dir, "expert_demos.npz")
+
+# -----------------------------------------------------------------------------
+# 4)  SIMPLE DDPM COPILOT
+#     (lightweight: cosine schedule, linear β_t, MLP ε‑predictor)
+# -----------------------------------------------------------------------------
+class EpsPredNet(nn.Module):
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim + act_dim + 1, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, act_dim),
+        )
+
+    def forward(self, x, t):
+        # t ∈ [0,1] as float
+        return self.net(torch.cat([x, t.unsqueeze(-1)], -1))
+
+class DiffusionCopilot:
+    def __init__(self, obs_dim: int, act_dim: int,
+                 timesteps: int = 1000,
+                 beta_start: float = 1e-4,
+                 beta_end: float = 0.02,
+                 lr: float = 3e-4,
+                 device: str = "auto"):
+        self.timesteps = timesteps
+        self.device = torch.device("cuda" if torch.cuda.is_available() and device == "auto" else "cpu")
+        self.betas = torch.linspace(beta_start, beta_end, timesteps, device=self.device)
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.net = EpsPredNet(obs_dim, act_dim).to(self.device)
+        self.optim = optim.Adam(self.net.parameters(), lr=lr)
+
+    # q sample: add noise at arbitrary timestep t
+    def q_sample(self, x0, t, noise):
+        acp = self.alphas_cumprod[t].unsqueeze(1)
+        return torch.sqrt(acp) * x0 + torch.sqrt(1 - acp) * noise
+
+    def train_loop(self, loader: DataLoader, epochs: int = 10):
+        self.net.train()
+        for epoch in range(epochs):
+            for obs, act in loader:
+                obs, act = obs.to(self.device), act.to(self.device)
+                noise = torch.randn_like(act)
+                t = torch.randint(0, self.timesteps, (act.size(0),), device=self.device)
+                noisy = self.q_sample(act, t, noise)
+                pred_eps = self.net(torch.cat([obs, noisy], dim=1), t.float() / self.timesteps)
+                loss = nn.functional.mse_loss(pred_eps, noise)
+                self.optim.zero_grad()
+                loss.backward()
+                self.optim.step()
+            if epoch % 5 == 0:
+                print(f"[DDPM] epoch {epoch:03d} | loss={loss.item():.4f}")
+
+    # single reverse step (DDIM‑like ancestral)
+    def predict(self, obs, a_p, steps: int = 50):
+        self.net.eval()
+        obs = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        x = torch.tensor(a_p, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            for i in reversed(range(steps)):
+                t = torch.full((1,), i, device=self.device)
+                eps = self.net(torch.cat([obs, x], dim=1), t.float() / self.timesteps)
+                alpha = self.alphas[i]
+                alpha_bar = self.alphas_cumprod[i]
+                x = (1/torch.sqrt(alpha)) * (x - (1-alpha)/torch.sqrt(1-alpha_bar) * eps)
+                if i > 0:
+                    noise = torch.randn_like(x)
+                    beta = self.betas[i]
+                    x += torch.sqrt(beta) * noise
+        return x.squeeze(0).cpu().numpy()
+
+# -----------------------------------------------------------------------------
+# UTIL – tiny wrapper to expose critic‑Q for arbitrary (s,a)
+# -----------------------------------------------------------------------------
+class ExpertQ(nn.Module):
+    def __init__(self, saved: dict, obs_dim: int, act_dim: int):
+        super().__init__()
+        self.q1 = SAC.load("dummy").critic.qf1  # placeholder to get architecture
+        # overwrite weights afterwards
+    # (for brevity we omit full code – see README)
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+def main(args):
+    out_root = pathlib.Path(args.out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    # ---------- 1) Expert ----------------------------------------------------
+    if not (out_root / "expert" / "sac_expert.zip").exists():
+        expert = train_expert(args.expert_steps, save_dir=out_root / "expert")
+    else:
+        expert = SAC.load(out_root / "expert" / "sac_expert")
+
+    # ---------- 2) Demonstrations -------------------------------------------
+    demo_file = out_root / "demos" / "expert_demos.npz"
+    if not demo_file.exists():
+        demo_file = collect_demonstrations(expert,
+                                           n_transitions=args.demo_transitions,
+                                           save_dir=out_root / "demos")
+    demos = np.load(demo_file)
+    obs, acts = demos["s"], demos["a"]
+    dataset = TensorDataset(torch.from_numpy(obs), torch.from_numpy(acts))
+    loader = DataLoader(dataset, batch_size=2048, shuffle=True, drop_last=True)
+
+    # --------- 3) Train Diffusion Copilot -----------------------------------
+    obs_dim, act_dim = obs.shape[1], acts.shape[1]
+    copilot = DiffusionCopilot(obs_dim, act_dim,
+                               timesteps=1000,
+                               lr=args.ddpm_lr,
+                               device="auto")
+    copilot.train_loop(loader, epochs=args.ddpm_epochs)
+    torch.save(copilot.net.state_dict(), out_root / "copilot_ddpm.pt")
+
+    # --------- 4) Export quick‑config ---------------------------------------
+    cfg = dict(
+        obs_dim=int(obs_dim),
+        act_dim=int(act_dim),
+        timesteps=1000,
+        q_heads=str(out_root / "expert" / "q_heads.pt"),
+        ddpm_weights=str(out_root / "copilot_ddpm.pt"),
+    )
+    json.dump(cfg, open(out_root / "ida_config.json", "w"), indent=2)
+    print("\n✅  All artefacts written to", out_root.resolve())
+
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--expert_steps", type=int, default=3_000_000,
+                   help="SAC training steps for the expert")
+    p.add_argument("--demo_transitions", type=int, default=1_000_000,
+                   help="#state‑action pairs to record from the expert")
+    p.add_argument("--ddpm_epochs", type=int, default=200,
+                   help="gradient steps over the demo set")
+    p.add_argument("--ddpm_lr", type=float, default=3e-4,
+                   help="learning rate for diffusion ε‑network")
+    p.add_argument("--out_dir", type=str, default="ida_outputs")
+    args = p.parse_args()
+    main(args)
+

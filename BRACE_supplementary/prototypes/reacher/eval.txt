@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+# evaluate_brace_reacher.py
+# -----------------------------------------------------------
+#  Quantitative evaluation of BRACE on MuJoCo Reacher‑v4
+#  Metrics: Success rate, completion time, path efficiency …
+# -----------------------------------------------------------
+import os, math, argparse, json, csv, pathlib
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import gymnasium as gym
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import torch, torch.nn as nn
+from stable_baselines3 import SAC
+
+# ------------- hyper‑parameters (can be cli‑overridden) --------------
+GOAL_RADIUS = 0.18
+MAX_STEPS   = 400
+
+# ==================== helper classes (same shapes as training) =======
+class BayesianIntent(nn.Module):
+    def __init__(self):
+        super().__init__()
+        th = torch.linspace(0, 2*math.pi, 9)[:-1]
+        self.register_buffer("goals", torch.stack(
+            [GOAL_RADIUS*torch.cos(th), GOAL_RADIUS*torch.sin(th)], 1))
+        self.raw_beta = nn.Parameter(torch.zeros(1))
+        self.raw_wang = nn.Parameter(torch.zeros(1))
+    def forward(self, tip, h_vec, belief=None):
+        beta = torch.nn.functional.softplus(self.raw_beta)
+        w    = torch.nn.functional.softplus(self.raw_wang)
+        vec  = self.goals[None,:,:]-tip[:,None,:]
+        dirg = vec/(vec.norm(dim=-1,keepdim=True)+1e-8)
+        hdir = h_vec/(h_vec.norm(dim=-1,keepdim=True)+1e-8)
+        angle= torch.arccos(torch.clamp((dirg*hdir[:,None,:]).sum(-1),-1.,1.))
+        ll   = torch.exp(-beta*w*angle)
+        if belief is None:
+            belief = torch.ones_like(ll)/ll.size(1)
+        belief = belief*ll
+        belief = belief/belief.sum(dim=1,keepdim=True)
+        return belief
+
+class GammaAC(nn.Module):
+    def __init__(self, obs_dim):
+        super().__init__()
+        hid=256
+        self.shared = nn.Sequential(nn.Linear(obs_dim,hid),nn.ReLU(),
+                                    nn.Linear(hid,hid),nn.ReLU())
+        self.mu = nn.Linear(hid,1)
+    def forward(self, obs):
+        feat=self.shared(obs)
+        return torch.tanh(self.mu(feat))      # a∈[-1,1]
+
+# ==================== surrogate pilot (OU or Gaussian) ===============
+class OUNoise:
+    def __init__(self, mu=0, theta=0.15, sigma=0.2, dt=1/50):
+        self.mu, self.theta, self.sigma, self.dt = mu,theta,sigma,dt
+        self.state = np.ones(2)*mu
+    def reset(self): self.state[:] = self.mu
+    def __call__(self):
+        x=self.state
+        dx=self.theta*(self.mu-x)*self.dt + self.sigma*np.sqrt(self.dt)*np.random.randn(2)
+        self.state = x+dx
+        return self.state
+
+class SurrogatePilot:
+    def __init__(self, expert_path, noise="ou", sigma=0.2):
+        self.expert=SAC.load(expert_path, device="cpu")
+        if noise=="ou":
+            self.noise=OUNoise(sigma=sigma)
+        else:
+            self.noise=None
+        self.noise_type=noise; self.sigma=sigma
+    def reset(self):
+        if self.noise_type=="ou": self.noise.reset()
+    def act(self, obs):
+        e_act,_=self.expert.predict(obs, deterministic=True)
+        if self.noise_type=="ou":
+            return np.clip(e_act+self.noise(),-1,1),e_act
+        else:
+            return np.clip(e_act+np.random.normal(0,self.sigma,2),-1,1),e_act
+
+# ==================== metric helpers ================================
+def fingertip_pos(obs):                               # obs ndarray (11,)
+    return obs[6:8]
+def target_pos(obs):
+    return obs[8:10]
+
+def path_efficiency(path_xy, target):
+    if len(path_xy)<2: return 0.0
+    straight= np.linalg.norm(path_xy[0]-target)
+    travelled= np.sum(np.linalg.norm(np.diff(path_xy,axis=0),axis=1))
+    return straight/travelled if travelled>1e-6 else 0.0
+
+# ==================== evaluation loop ===============================
+def evaluate(args):
+    # load brace policy
+    ckpt=torch.load(args.brace, map_location="cpu")
+    bayes = BayesianIntent(); bayes.load_state_dict(ckpt["bayes"])
+    gamma = GammaAC(obs_dim=11+8);    gamma.load_state_dict(ckpt["gamma"]); gamma.eval()
+
+    pilot = SurrogatePilot(args.expert, args.noise, args.sigma)
+    env   = gym.make("Reacher-v4", render_mode=("human" if args.render else None))
+
+    results=[]
+    for ep in range(args.episodes):
+        obs,_ = env.reset(seed=ep)
+        pilot.reset()
+        belief = torch.ones(1,8)/8
+        path=[fingertip_pos(obs).copy()]
+        done=trunc=False; ret=0.0
+        for t in range(MAX_STEPS):
+            tip = torch.tensor(fingertip_pos(obs)).float().unsqueeze(0)
+            h_act,_  = pilot.act(obs)
+            h_act_t  = torch.tensor(h_act).float().unsqueeze(0)
+            belief   = bayes(tip, h_act_t, belief)
+            inp      = torch.tensor(obs).float().unsqueeze(0)
+            obs_pi   = torch.cat([inp, belief], dim=1)
+            a        = gamma(obs_pi).squeeze().item()
+            gamma_val= 0.5*(a+1)
+            e_act,_  = pilot.expert.predict(obs, deterministic=True)
+            act      = gamma_val*e_act + (1-gamma_val)*h_act
+            obs,r,done,trunc,_=env.step(act)
+            ret+=r
+            path.append(fingertip_pos(obs).copy())
+            if done or trunc: break
+        succ = (np.linalg.norm(fingertip_pos(obs)-target_pos(obs))<GOAL_RADIUS)&(not trunc)
+        comp_time = t+1
+        pe = path_efficiency(np.asarray(path), target_pos(path[0]))
+        results.append({"success":succ,"steps":comp_time,"eff":pe,"return":ret})
+        if args.verbose:
+            print(f"ep {ep:03d}  suc={succ}  steps={comp_time}  eff={pe:.3f}")
+    env.close()
+
+    df=pd.DataFrame(results)
+    df.to_csv("eval_metrics.csv", index=False)
+    print("\n===== SUMMARY over", args.episodes,"episodes =====")
+    print(df.describe().loc[["mean","std"]])
+
+    # ------------- figures ---------------
+    pathlib.Path("figures").mkdir(exist_ok=True)
+    plt.figure(figsize=(8,4))
+    plt.subplot(121); df["steps"].hist(alpha=0.7); plt.title("Completion time (steps)")
+    plt.subplot(122); df["eff"].hist(alpha=0.7);   plt.title("Path efficiency")
+    plt.tight_layout(); plt.savefig("figures/histograms.png",dpi=150); plt.close()
+
+    plt.figure(figsize=(6,4))
+    df.boxplot(column=["steps","eff"]); plt.title("Distribution"); plt.savefig("figures/boxplots.png",dpi=150)
+    plt.close()
+    print("✓ saved csv & figures to ./eval_metrics.csv and ./figures/")
+
+# ==================== CLI ===========================================
+if __name__=="__main__":
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--brace", default="brace_integrated_reacher.pt", help="integrated model ckpt")
+    ap.add_argument("--expert", default="expert_reacher.zip")
+    ap.add_argument("--episodes", type=int, default=200)
+    ap.add_argument("--noise", choices=["ou","gauss"], default="ou")
+    ap.add_argument("--sigma", type=float, default=0.2)
+    ap.add_argument("--render", action="store_true")
+    ap.add_argument("--verbose", action="store_true")
+    args=ap.parse_args()
+    evaluate(args)
+

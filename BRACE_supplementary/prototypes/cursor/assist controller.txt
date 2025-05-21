@@ -1,0 +1,122 @@
+# assist_controller.py
+# -----------------------------------------------------------
+#  All goal‑inference + assistance logic for the cursor study
+# -----------------------------------------------------------
+import math, pathlib
+import numpy as np
+import torch, torch.nn as nn
+from torch.distributions import Normal
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ────────────────────────────────────────────────────────────
+#  Bayesian goal‑inference filter
+# ────────────────────────────────────────────────────────────
+class BayesFilter(nn.Module):
+    def __init__(self, n_goals=8):
+        super().__init__()
+        self.raw_beta  = nn.Parameter(torch.tensor(2.0))
+        self.raw_kappa = nn.Parameter(torch.tensor(1.0))
+        self.n_goals   = n_goals
+    def forward(self, dot_xy, h_vec, goals_xy, prev=None):
+        beta  = torch.softplus(self.raw_beta)
+        kappa = torch.softplus(self.raw_kappa)
+        vec   = goals_xy[None,:,:] - dot_xy[:,None,:]                # B×G×2
+        dir_g = vec / (vec.norm(dim=-1, keepdim=True)+1e-8)
+        h_dir = h_vec / (h_vec.norm(dim=-1, keepdim=True)+1e-8)
+        ang   = torch.arccos(torch.clamp((dir_g*h_dir[:,None,:]).sum(-1), -1., 1.))
+        ll    = torch.exp(-beta*kappa*ang)
+        if prev is None: prev = torch.ones_like(ll)/self.n_goals
+        post  = ll*prev
+        post  = post / post.sum(dim=1, keepdim=True)
+        return post
+
+# ────────────────────────────────────────────────────────────
+#  Γ‑actor–critic (continuous γ)
+# ────────────────────────────────────────────────────────────
+class GammaPolicy(nn.Module):
+    def __init__(self, obs_dim):
+        super().__init__()
+        hid = 256
+        self.body = nn.Sequential(nn.Linear(obs_dim,hid), nn.ReLU(),
+                                  nn.Linear(hid,hid), nn.ReLU())
+        self.mu   = nn.Linear(hid,1)
+    def forward(self,x):
+        return torch.tanh(self.mu(self.body(x)))          # (B,1), in [-1,1]
+
+# ────────────────────────────────────────────────────────────
+#  small helper MLP for IDA / DQN baselines
+# ────────────────────────────────────────────────────────────
+class SmallMLP(nn.Module):
+    def __init__(self, obs_dim):
+        super().__init__()
+        self.net=nn.Sequential(nn.Linear(obs_dim,128), nn.ReLU(),
+                               nn.Linear(128,1))
+    def forward(self,x): return self.net(x)
+
+# ────────────────────────────────────────────────────────────
+#  AssistanceController
+# ────────────────────────────────────────────────────────────
+class AssistanceController:
+    def __init__(self, model_dir="."):
+        p = pathlib.Path(model_dir)
+
+        # eight fixed goals (same geometry as env init) – radius 250 px
+        r = 250
+        cx, cy = 600, 400
+        th = np.linspace(0, 2*math.pi, 9)[:-1]
+        self.goals = torch.tensor(np.stack([cx+r*np.cos(th),
+                                            cy+r*np.sin(th)],1),
+                                  dtype=torch.float32, device=DEVICE)
+
+        # load networks
+        self.bayes = BayesFilter().to(DEVICE)
+        self.bayes.load_state_dict(torch.load(p/"bayes_cursor.pt", map_location=DEVICE))
+        self.bayes.eval()
+
+        self.gamma = GammaPolicy(obs_dim=18).to(DEVICE)         # 10‑obs + 8‑belief
+        self.gamma.load_state_dict(torch.load(p/"gamma_cursor.pt", map_location=DEVICE))
+        self.gamma.eval()
+
+        self.ida  = SmallMLP(obs_dim=10).to(DEVICE)
+        self.ida.load_state_dict(torch.load(p/"ida_gamma.pt",  map_location=DEVICE))
+        self.ida.eval()
+
+        self.dqn  = SmallMLP(obs_dim=10).to(DEVICE)
+        self.dqn.load_state_dict(torch.load(p/"dqn_gamma.pt",  map_location=DEVICE))
+        self.dqn.eval()
+
+    # --------------------------------------------------------
+    def update_belief(self, dot_xy, h_vec, prev_belief):
+        dot = torch.tensor(dot_xy, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        hv  = torch.tensor(h_vec,  dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        prev= None if prev_belief is None else torch.tensor(prev_belief,
+                                                            dtype=torch.float32,
+                                                            device=DEVICE)
+        post = self.bayes(dot, hv, self.goals, prev)            # (1,G)
+        return post.cpu().numpy()[0], int(torch.argmax(post).item())
+
+    # --------------------------------------------------------
+    def gamma_value(self, mode, obs10, belief8):
+        """mode = 'brace'|'ida'|'dqn'|'fixed'"""
+        o = torch.tensor(obs10, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+
+        if mode=="brace":
+            inp = torch.tensor(np.concatenate([obs10, belief8]),
+                               dtype=torch.float32, device=DEVICE).unsqueeze(0)
+            g_raw = self.gamma(inp).item()
+            return 0.5*(g_raw+1.0)
+
+        if mode=="ida":
+            prob = torch.sigmoid(self.ida(o)).item()
+            return 1.0 if prob>0.5 else 0.0        # binary
+
+        if mode=="dqn":
+            g_raw = torch.tanh(self.dqn(o)).item()
+            return 0.5*(g_raw+1.0)
+
+        if mode=="fixed":
+            return 0.2
+
+        raise ValueError(mode)
+

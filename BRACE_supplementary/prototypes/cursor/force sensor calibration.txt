@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+# force_cal_gui.py  –  Load‑cell calibration + live plots
+# Copyright 2025
+# -----------------------------------------------------------------------------
+from __future__ import annotations
+
+import argparse
+import logging
+import math
+import queue
+import random
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+import serial
+import tkinter as tk
+from tkinter import ttk
+
+
+# -----------------------------------------------------------------------------
+# CONFIG / CONSTANTS
+# -----------------------------------------------------------------------------
+@dataclass(frozen=True)
+class CalibConst:
+    z_smooth_alpha: float = 0.2
+    stop_threshold: float = 0.01
+    z_weight4_min: float = 0.02
+    z_weight4_max_pos: float = 1.0
+    z_weight4_max_neg: float = 0.7
+    z_force_cal: float = 4.45
+    xy_force_cal: float = 1.33
+    graph_window: float = 10.0           # seconds
+    graph_scale_z: float = 2.5
+    graph_scale_xy: float = 2.5
+    min_mag: float = 0.03
+    thresh_angle: float = 3.0
+    thresh_mag: float = 0.02
+    force_thresh: float = 0.05
+    canvas_size: int = 480
+
+
+C = CalibConst()
+
+# -----------------------------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    filename="calibration.log",
+    filemode="w",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+
+# -----------------------------------------------------------------------------
+# 1)  SERIAL READER  (thread → queue)
+# -----------------------------------------------------------------------------
+class SerialReader(threading.Thread):
+    """Continuously read CSV lines `w1,w2,w3,w4,fx,fy,mag,ang`."""
+    def __init__(self, port: str, baud: int, out_q: queue.Queue, **kw):
+        super().__init__(daemon=True, **kw)
+        self.out_q = out_q
+        try:
+            self.ser = serial.Serial(port, baud, timeout=0.01)
+            logging.info("Serial opened on %s @ %d", port, baud)
+        except serial.SerialException as exc:
+            logging.error("Cannot open serial: %s", exc)
+            self.ser = None
+
+    def run(self):
+        if self.ser is None:
+            return
+        while True:
+            try:
+                line = self.ser.readline().decode().strip()
+                if not line:
+                    continue
+                vals = list(map(float, line.split(",")))
+                if len(vals) != 8:
+                    continue
+                now = time.time()
+                self.out_q.put(
+                    dict(
+                        w=np.array(vals[:4]),
+                        fx=vals[4],
+                        fy=vals[5],
+                        mag=vals[6],
+                        ang=vals[7],
+                        t=now,
+                    )
+                )
+            except Exception as exc:  # noqa: broad‑except (robust serial loop)
+                logging.warning("serial error: %s", exc)
+
+
+# -----------------------------------------------------------------------------
+# 2)  FILTER & CALIBRATION UTILITIES
+# -----------------------------------------------------------------------------
+def z_estimate(weights: np.ndarray) -> float:
+    z_blue = weights[0] - weights[2]
+    z_red = weights[3]
+    if z_red >= 0:
+        blend = np.clip(
+            (z_red - C.z_weight4_min) / (C.z_weight4_max_pos - C.z_weight4_min),
+            0.0,
+            1.0,
+        )
+    else:
+        blend = np.clip(
+            (abs(z_red) - C.z_weight4_min) / (C.z_weight4_max_neg - C.z_weight4_min),
+            0.0,
+            1.0,
+        )
+    return ((1 - blend) * z_blue + blend * z_red) * C.z_force_cal
+
+
+def low_pass(prev: float | None, new: float, alpha: float) -> float:
+    return new if prev is None else prev + alpha * (new - prev)
+
+
+def apply_user_filter(raw: float, smooth: float, slider_val: int) -> float:
+    """
+    Positive slider → blend towards `smooth`; negative → add noise.
+    """
+    if slider_val >= 0:
+        return raw * (1 - slider_val / 50) + smooth * (slider_val / 50)
+    return raw + (abs(slider_val) / 50) * random.gauss(0, 0.05)
+
+
+# -----------------------------------------------------------------------------
+# 3)  SIMPLE TIME‑SERIES PLOTTER  (canvas line strip)
+# -----------------------------------------------------------------------------
+class TimeSeriesPlot:
+    def __init__(self, parent: tk.Frame, height: int, colour: str, scale: float):
+        self.canvas = tk.Canvas(parent, width=C.canvas_size, height=height, bg="white")
+        self.canvas.pack(fill="both", expand=True)
+        self.colour = colour
+        self.scale = scale
+        self.buf: list[Tuple[float, float]] = []
+
+    def append(self, t: float, val: float):
+        self.buf.append((t, val))
+        self.buf = [p for p in self.buf if p[0] >= t - C.graph_window]
+
+    def redraw(self):
+        self.canvas.delete("all")
+        if len(self.buf) < 2:
+            return
+        t0 = self.buf[0][0]
+        pts = []
+        for tp, val in self.buf:
+            x = (tp - t0) / C.graph_window * C.canvas_size
+            y = self.canvas.winfo_height() / 2 - (val / self.scale) * (
+                self.canvas.winfo_height() / 2
+            )
+            pts.extend((x, y))
+        self.canvas.create_line(pts, fill=self.colour, width=2)
+        # zero‑line
+        mid = self.canvas.winfo_height() / 2
+        self.canvas.create_line(0, mid, C.canvas_size, mid, fill="gray", dash=(2, 2))
+
+
+# -----------------------------------------------------------------------------
+# 4)  MAIN GUI
+# -----------------------------------------------------------------------------
+class CalibGUI:
+    def __init__(self, root: tk.Tk, sample_q: queue.Queue):
+        self.root = root
+        self.q = sample_q
+
+        # State
+        self.prev_sample: dict | None = None
+        self.smooth = dict(z=None, fx=None, fy=None)
+        self.gui_state = dict(angle=None, mag=None)
+
+        # Widgets ------------------------------------------------------------------
+        root.title("Force‑Sensor Calibration")
+        root.geometry("1180x820")
+        root.columnconfigure(1, weight=1)
+        root.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(root);  left.grid(row=0, column=0, padx=10, pady=10, sticky="n")
+        right = ttk.Frame(root); right.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
+        right.rowconfigure(0, weight=3); right.rowconfigure(1, weight=1); right.rowconfigure(2, weight=1)
+
+        # weight labels
+        self.w_labels = [ttk.Label(left, text=f"W{i+1}: 0.00 kg") for i in range(4)]
+        for lbl in self.w_labels: lbl.pack(anchor="w")
+
+        # XY / Z toggle
+        self.mode = tk.StringVar(value="XY")
+        self.toggle_btn = ttk.Button(left, text="Switch to Z Mode", command=self.toggle_mode)
+        self.toggle_btn.pack(pady=8, anchor="w")
+
+        # filter slider
+        self.slider = tk.Scale(left, from_=-100, to=100, orient="horizontal", label="Filter", length=200)
+        self.slider.set(0); self.slider.pack(anchor="w")
+
+        # value labels
+        self.mag_lbl   = ttk.Label(left, text="Mag: 0.00 kg");   self.mag_lbl.pack(anchor="w")
+        self.ang_lbl   = ttk.Label(left, text="Angle: N/A");     self.ang_lbl.pack(anchor="w")
+        self.z_lbl     = ttk.Label(left, text="Fz: 0.00 kg");    self.z_lbl.pack(anchor="w")
+
+        # plots
+        self.plot_xy = TimeSeriesPlot(right, height=C.canvas_size, colour="#1976D2", scale=C.graph_scale_xy)
+        self.plot_fx = TimeSeriesPlot(right, height=140, colour="blue",   scale=C.graph_scale_xy)
+        self.plot_fy = TimeSeriesPlot(right, height=140, colour="red",    scale=C.graph_scale_xy)
+        self.plot_z  = TimeSeriesPlot(right, height=C.canvas_size, colour="#1976D2", scale=C.graph_scale_z)
+
+        self.update_gui()           # start loop
+
+    # -------------------------------------------------------------------------
+    # GUI helpers
+    # -------------------------------------------------------------------------
+    def toggle_mode(self):
+        if self.mode.get() == "XY":
+            self.mode.set("Z"); self.toggle_btn.configure(text="Switch to XY Mode")
+        else:
+            self.mode.set("XY"); self.toggle_btn.configure(text="Switch to Z Mode")
+
+    # -------------------------------------------------------------------------
+    # Main loop  (called every 15 ms)
+    # -------------------------------------------------------------------------
+    def update_gui(self):
+        try:
+            sample = self.q.get_nowait()
+            self.process(sample)
+        except queue.Empty:
+            pass
+        # schedule again
+        self.root.after(15, self.update_gui)
+
+    # -------------------------------------------------------------------------
+    # Core processing  (interp, smoothing, filtering, plotting)
+    # -------------------------------------------------------------------------
+    def process(self, s: dict):
+        if self.prev_sample is None:
+            self.prev_sample = s
+            return
+
+        # linear interpolation to render time
+        now = time.time()
+        t0, t1 = self.prev_sample["t"], s["t"]
+        f = 1.0 if t1 == t0 else np.clip((now - t0) / (t1 - t0), 0.0, 1.0)
+        w = (1 - f) * self.prev_sample["w"] + f * s["w"]
+        fx = (1 - f) * self.prev_sample["fx"] + f * s["fx"]
+        fy = (1 - f) * self.prev_sample["fy"] + f * s["fy"]
+        mag = (1 - f) * self.prev_sample["mag"] + f * s["mag"]
+        ang = (1 - f) * self.prev_sample["ang"] + f * s["ang"]
+
+        # Z estimate + smoothing
+        z_raw = z_estimate(w)
+        self.smooth["z"] = low_pass(self.smooth["z"], z_raw, C.z_smooth_alpha)
+        self.smooth["fx"] = low_pass(self.smooth["fx"], fx, C.z_smooth_alpha)
+        self.smooth["fy"] = low_pass(self.smooth["fy"], fy, C.z_smooth_alpha)
+
+        # user filter
+        filt = self.slider.get()
+        z_fin  = apply_user_filter(z_raw,   self.smooth["z"],  filt)
+        fx_fin = apply_user_filter(fx,      self.smooth["fx"], filt)
+        fy_fin = apply_user_filter(fy,      self.smooth["fy"], filt)
+        mag_fin = apply_user_filter(mag * C.xy_force_cal,
+                                    mag * C.xy_force_cal, filt)
+
+        # update labels
+        for i, lbl in enumerate(self.w_labels):
+            lbl.configure(text=f"W{i+1}: {w[i]:+06.2f} kg")
+
+        if self.mode.get() == "XY":
+            self.mag_lbl.configure(text=f"Mag: {mag_fin:+06.2f} kg")
+            if mag_fin < C.force_thresh:
+                self.ang_lbl.configure(text="Angle: N/A")
+            else:
+                self.ang_lbl.configure(text=f"Angle: {ang:+06.2f}°")
+            self.z_lbl.configure(text="Fz: N/A")
+            # plots
+            self.plot_xy.append(now, mag_fin)
+            self.plot_fx.append(now, fx_fin)
+            self.plot_fy.append(now, fy_fin)
+            self.plot_xy.redraw(); self.plot_fx.redraw(); self.plot_fy.redraw()
+        else:
+            self.z_lbl.configure(text=f"Fz: {z_fin:+06.2f} kg")
+            self.plot_z.append(now, z_fin)
+            self.plot_z.redraw()
+
+        self.prev_sample = s
+
+
+# -----------------------------------------------------------------------------
+# MAIN — CLI
+# -----------------------------------------------------------------------------
+def cli() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Force‑sensor calibration GUI")
+    ap.add_argument("--port", type=str, default="COM5", help="serial port")
+    ap.add_argument("--baud", type=int, default=115200, help="baud rate")
+    return ap.parse_args()
+
+
+def main():
+    args = cli()
+    sample_q: queue.Queue = queue.Queue(maxsize=5)
+    SerialReader(args.port, args.baud, sample_q).start()
+
+    root = tk.Tk()
+    CalibGUI(root, sample_q)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+

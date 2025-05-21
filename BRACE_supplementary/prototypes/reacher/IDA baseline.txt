@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+# train_ida_reacher.py  –  IDA baseline pre‑training for Reacher‑2D
+# ---------------------------------------------------------------
+#  © 2025   MIT License
+#  Follows Algorithm 1 in “Shared Autonomy with IDA” (NeurIPS 24)
+# ---------------------------------------------------------------
+from __future__ import annotations
+import argparse, json, math, os, pathlib, random, copy, time
+from typing import Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm.auto import tqdm
+
+import gymnasium as gym
+from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+# ------------------------------------------------------------------
+# 1.  ENVIRONMENT  (default: MuJoCo Reacher‑v4)  --------------------
+# ------------------------------------------------------------------
+def make_env(full_obs: bool = True):
+    """
+    Returns an env whose .observation_space is:
+      *full_obs=True*   : [ sinθ1 cosθ1 sinθ2 cosθ2 dθ1 dθ2 (x_e,y_e) (x_t,y_t) ]
+      *full_obs=False*  : same but target coords zeroed  (goal‑masked)
+    This trick matches § 3.3 of the IDA paper.
+    """
+    base = gym.make("Reacher-v4")   # requires mujoco
+    if full_obs:
+        return base
+
+    class GoalMasked(gym.ObservationWrapper):
+        def __init__(self, env):
+            super().__init__(env)
+            low = env.observation_space.low.copy()
+            high = env.observation_space.high.copy()
+            # last 2 dims are target x,y  in MuJoCo Reacher
+            low[-2:] = 0.0 ; high[-2:] = 0.0
+            self.observation_space = gym.spaces.Box(low, high, dtype=np.float32)
+
+        def observation(self, obs):
+            obs = obs.copy()
+            obs[-2:] = 0.0
+            return obs
+    return GoalMasked(base)
+
+# ------------------------------------------------------------------
+# 2.  TRAIN SAC EXPERT  -------------------------------------------
+# ------------------------------------------------------------------
+def train_expert(total_steps: int, seed: int, save_dir: pathlib.Path) -> SAC:
+    os.makedirs(save_dir, exist_ok=True)
+    env = DummyVecEnv([lambda: make_env(full_obs=True)])
+    model = SAC(
+        "MlpPolicy",
+        env,
+        learning_rate=3e-4,
+        gamma=0.98,
+        tau=0.005,
+        buffer_size=1_000_000,
+        batch_size=1024,
+        train_freq=(1, "episode"),
+        gradient_steps=1,
+        policy_kwargs=dict(net_arch=[256, 256, 256]),
+        seed=seed,
+        device="auto",
+        verbose=1,
+    )
+    model.learn(total_timesteps=total_steps, progress_bar=True)
+    model.save(save_dir / "sac_expert")
+    # export Q‑heads for runtime advantage computations
+    torch.save(
+        {
+            "qf1": model.critic.qf1.state_dict(),
+            "qf2": model.critic.qf2.state_dict(),
+        },
+        save_dir / "q_heads.pt",
+    )
+    env.close()
+    return model
+
+# ------------------------------------------------------------------
+# 3.  COLLECT GOAL‑MASKED DEMOS  -----------------------------------
+# ------------------------------------------------------------------
+def collect_demos(model: SAC,
+                  n_steps: int,
+                  save_file: pathlib.Path):
+    env = make_env(full_obs=False)            # goal‑masked
+    obs, _ = env.reset(seed=0)
+    S, A = [], []
+    for _ in tqdm(range(n_steps), desc="collect demos"):
+        act, _ = model.predict(obs, deterministic=True)
+        S.append(obs);  A.append(act)
+        obs, _, term, trunc, _ = env.step(act)
+        if term or trunc:
+            obs, _ = env.reset()
+    np.savez_compressed(save_file, s=np.asarray(S, np.float32),
+                        a=np.asarray(A, np.float32))
+    env.close()
+
+# ------------------------------------------------------------------
+# 4.  DIFFUSION COPILOT  -------------------------------------------
+# ------------------------------------------------------------------
+class EpsNet(nn.Module):
+    def __init__(self, obs_dim: int, act_dim: int, hid: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim + act_dim + 1, hid), nn.ReLU(),
+            nn.Linear(hid, hid), nn.ReLU(),
+            nn.Linear(hid, act_dim)
+        )
+    def forward(self, x, t):                 # t ∈ [0,1]
+        return self.net(torch.cat([x, t[:, None]], -1))
+
+
+class Diffusion:
+    def __init__(self, obs_dim, act_dim,
+                 T=1000, beta1=1e-4, beta2=0.02, lr=3e-4, device="auto"):
+        self.T = T
+        self.betas = torch.linspace(beta1, beta2, T)
+        self.alphas = 1.0 - self.betas
+        self.a_cum = torch.cumprod(self.alphas, 0)
+        self.net = EpsNet(obs_dim, act_dim).to(device)
+        self.opt = optim.Adam(self.net.parameters(), lr=lr)
+        self.dev = device
+
+    def q_sample(self, x0, t, eps):
+        a_bar = self.a_cum[t].unsqueeze(1)
+        return torch.sqrt(a_bar) * x0 + torch.sqrt(1 - a_bar) * eps
+
+    def train_loop(self, loader, epochs=200):
+        self.net.train()
+        for ep in range(epochs):
+            for obs, act in loader:
+                obs, act = obs.to(self.dev), act.to(self.dev)
+                eps = torch.randn_like(act)
+                t = torch.randint(0, self.T, (act.size(0),), device=self.dev)
+                noisy = self.q_sample(act, t, eps)
+                pred = self.net(torch.cat([obs, noisy], 1), t.float()/self.T)
+                loss = nn.functional.mse_loss(pred, eps)
+                self.opt.zero_grad(); loss.backward(); self.opt.step()
+            if ep % 20 == 0:
+                print(f"[DDPM] epoch {ep:03d}  loss {loss.item():.4f}")
+
+# ------------------------------------------------------------------
+# MAIN  -------------------------------------------------------------
+# ------------------------------------------------------------------
+def main(args):
+    out = pathlib.Path(args.out_dir)
+    (out / "expert").mkdir(parents=True, exist_ok=True)
+    # ---------- Expert -------------------------------------------------------
+    if not (out / "expert" / "sac_expert.zip").exists():
+        expert = train_expert(args.expert_steps, args.seed, out / "expert")
+    else:
+        expert = SAC.load(out / "expert" / "sac_expert")
+
+    # ---------- Demonstrations ----------------------------------------------
+    demo_file = out / "demos" / "expert_demos.npz"
+    if not demo_file.exists():
+        os.makedirs(out / "demos", exist_ok=True)
+        collect_demos(expert, args.demo_steps, demo_file)
+
+    demos = np.load(demo_file)
+    obs_dim = demos["s"].shape[1]; act_dim = demos["a"].shape[1]
+    ds = TensorDataset(torch.from_numpy(demos["s"]),
+                       torch.from_numpy(demos["a"]))
+    loader = DataLoader(ds, batch_size=2048, shuffle=True, drop_last=True)
+
+    # ---------- Copilot ------------------------------------------------------
+    diff = Diffusion(obs_dim, act_dim, lr=args.ddpm_lr, device="cuda" if torch.cuda.is_available() else "cpu")
+    diff.train_loop(loader, epochs=args.ddpm_epochs)
+    torch.save(diff.net.state_dict(), out / "copilot_ddpm.pt")
+
+    # ---------- Quick‑load config -------------------------------------------
+    cfg = dict(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        T=1000,
+        q_heads=str(out / "expert" / "q_heads.pt"),
+        ddpm=str(out / "copilot_ddpm.pt"),
+    )
+    with open(out / "ida_config.json", "w") as fp:
+        json.dump(cfg, fp, indent=2)
+    print("✅  all artefacts saved in", out.resolve())
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--expert_steps", type=int, default=3_000_000)
+    p.add_argument("--demo_steps",   type=int, default=1_000_000)
+    p.add_argument("--ddpm_epochs",  type=int, default=200)
+    p.add_argument("--ddpm_lr",      type=float, default=3e-4)
+    p.add_argument("--seed",         type=int, default=0)
+    p.add_argument("--out_dir",      type=str, default="ida_reacher_out")
+    main(p.parse_args())
+

@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+# train_actor_critic_brace.py
+# -----------------------------------------------------------
+# Train the BRACE actor‑critic (γ–policy + value) with PPO
+# -----------------------------------------------------------
+import os, math, random, argparse, json, time
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+
+import torch
+import torch.nn as nn
+from torch.distributions import Normal
+
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.policies import ActorCriticPolicy
+
+# ===========================================================
+#  1.  Analytic Bayesian goal‑inference stub (replace later)
+# ===========================================================
+class BayesianGoalInferenceStub:
+    """
+    Quick analytic approximation of Eq.(1)-(3) from BRACE.
+    Produces a |G|‑dim belief vector b_t every time step.
+    """
+    def __init__(self, goals, beta=8.0, w_th=0.8):
+        self.goals = np.array(goals, dtype=np.float32)
+        self.n = len(goals)
+        self.prior = np.ones(self.n, dtype=np.float32) / self.n
+        self.beta, self.w_th = beta, w_th
+        self.belief = self.prior.copy()
+
+    def reset(self):
+        self.belief[:] = self.prior
+
+    def step(self, cursor_xy, human_vec):
+        """Return updated belief vector (numpy, shape (n,))"""
+        if np.linalg.norm(human_vec) < 1e-5:
+            return self.belief        # no evidence
+        h_dir = human_vec / (np.linalg.norm(human_vec) + 1e-9)
+        log_lik = []
+        for g in self.goals:
+            to_g = g - cursor_xy
+            if np.linalg.norm(to_g) < 1e-5:
+                ang = 0.0
+            else:
+                to_dir = to_g / np.linalg.norm(to_g)
+                cos = np.clip(np.dot(h_dir, to_dir), -1., 1.)
+                ang = math.acos(cos)
+            log_lik.append(-self.beta * self.w_th * ang)
+        log_lik = np.array(log_lik, dtype=np.float32)
+        self.belief *= np.exp(log_lik - log_lik.max())  # for stability
+        self.belief /= self.belief.sum()
+        return self.belief.copy()
+
+# ===========================================================
+#  2.  Environment producing context ⊕ belief  (observation)
+# ===========================================================
+FULL = np.array([1200, 800], dtype=np.float32)
+MAX_SPEED = 3.0
+DOT_R, OBS_R, TGT_R = 14, 10, 9
+
+class BraceArbitrationEnv(gym.Env):
+    """
+    Observation  = [x,y, d_goal_norm, d_obs_norm, belief_1..belief_N]
+    Action (Box) = scalar a ∈[‑1,1]  →  γ = (a+1)/2
+    Reward       = −λ(γ − γ*)²  − 2 if collision
+    γ* computed from BRACE’s rule-of‑thumb:
+        near goal  → low γ
+        near obstacle → high γ
+        conflict → mid
+    """
+    metadata = {"render_modes": []}
+    def __init__(self, n_goals=6, seed=None):
+        super().__init__()
+        self.rng = np.random.default_rng(seed)
+        self.n_goals = n_goals
+        self.goal_xy = None
+        self.cursor  = None
+        self.obstacles = None
+        low  = np.concatenate([[0,0, 0,0], np.zeros(n_goals, np.float32)])
+        high = np.concatenate([FULL, 1*np.ones(2+n_goals, np.float32)])
+        self.observation_space = spaces.Box(low, high, dtype=np.float32)
+        self.action_space      = spaces.Box(-1.0, 1.0, shape=(), dtype=np.float32)
+
+        # geometry
+        self.max_dist = np.linalg.norm(FULL)
+        self.goal_thr = 120.0
+        self.obs_thr  = 120.0
+        # Bayesian filter
+        self.belief_filter = None
+
+    # -------------------------------------------------------
+    def _geometry_reset(self):
+        margin = 80
+        self.cursor = FULL/2
+        goals = []
+        while len(goals) < self.n_goals:
+            p = self.rng.uniform([margin,margin], FULL-[margin,margin])
+            if np.linalg.norm(p-self.cursor) > 250:
+                goals.append(p)
+        self.goals = np.stack(goals, axis=0)
+        obstacles = []
+        for g in goals[:3]:
+            t = self.rng.uniform(0.55,0.8)
+            base = self.cursor + t*(g-self.cursor)
+            perp = np.array([-(g-self.cursor)[1], (g-self.cursor)[0]])
+            perp /= np.linalg.norm(perp)+1e-9
+            off  = perp*self.rng.uniform(60,90)*self.rng.choice([-1,1])
+            obstacles.append(base+off)
+        self.obstacles = np.stack(obstacles, axis=0)
+
+    # -------------------------------------------------------
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self._geometry_reset()
+        self.goal_xy = self.goals[self.rng.integers(self.n_goals)]
+        self.step_cnt = 0
+        if self.belief_filter is None or self.belief_filter.n != self.n_goals:
+            self.belief_filter = BayesianGoalInferenceStub(self.goals)
+        else:
+            self.belief_filter.reset()
+        return self._get_obs(), {}
+
+    # -------------------------------------------------------
+    def _get_obs(self):
+        d_goal = np.linalg.norm(self.cursor-self.goal_xy)/self.max_dist
+        d_obs  = np.min(np.linalg.norm(self.cursor-self.obstacles, axis=1))/self.max_dist
+        obs = np.concatenate([self.cursor, [d_goal, d_obs], self.belief])
+        return obs.astype(np.float32)
+
+    # -------------------------------------------------------
+    @property
+    def belief(self):
+        return self.belief_filter.belief
+
+    def _ideal_gamma(self, d_goal, d_obs):
+        if d_goal < self.goal_thr/self.max_dist and d_obs < self.obs_thr/self.max_dist:
+            return 0.5
+        if d_goal < self.goal_thr/self.max_dist:
+            return 0.2
+        if d_obs  < self.obs_thr /self.max_dist:
+            return 0.8
+        return 0.5
+
+    def step(self, action):
+        a = float(action)
+        gamma = (a+1.0)/2.0                       # map [‑1,1]→[0,1]
+
+        # synthetic human vector: noisy ideal
+        w_dir = (self.goal_xy-self.cursor)
+        w_dir /= np.linalg.norm(w_dir)+1e-9
+        h_dir = w_dir + self.rng.normal(0, 0.3, size=2)
+        h_dir /= np.linalg.norm(h_dir)+1e-9
+
+        # update belief
+        self.belief_filter.step(self.cursor, h_dir)
+
+        # blended motion
+        step_vec = (gamma*w_dir + (1-gamma)*h_dir)
+        step_vec /= np.linalg.norm(step_vec)+1e-9
+        self.cursor = np.clip(self.cursor + step_vec*MAX_SPEED, [0,0], FULL)
+
+        # collision?
+        collide = (np.min(np.linalg.norm(self.cursor-self.obstacles, axis=1)) < DOT_R+OBS_R)
+
+        self.step_cnt += 1
+        d_goal = np.linalg.norm(self.cursor-self.goal_xy)/self.max_dist
+        d_obs  = np.min(np.linalg.norm(self.cursor-self.obstacles, axis=1))/self.max_dist
+        ideal_g = self._ideal_gamma(d_goal, d_obs)
+
+        reward = -20*(gamma-ideal_g)**2
+        terminated = collide
+        if collide: reward -= 2.0
+        truncated = self.step_cnt >= 400
+
+        obs = self._get_obs()
+        info = {"ideal_gamma": ideal_g}
+        return obs, float(reward), terminated, truncated, info
+
+# ===========================================================
+#  3.  Custom policy (shared trunk → π‑head & V‑head)
+# ===========================================================
+class GammaBeliefPolicy(ActorCriticPolicy):
+    """
+    Observation dims vary with |G|, so build net at runtime.
+    Action: tanh‑squashed scalar a∈[‑1,1]  (γ = 0.5(a+1))
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    def build_mlp(self, sizes):
+        layers = []
+        for i in range(len(sizes)-1):
+            layers += [nn.Linear(sizes[i], sizes[i+1]), nn.ReLU()]
+        return nn.Sequential(*layers[:-1])          # drop last ReLU
+    def _build(self, obs_dim):
+        hidden = 256
+        self.shared = self.build_mlp([obs_dim, hidden, hidden])
+        self.mu_head = nn.Linear(hidden, 1)
+        self.log_std = nn.Parameter(torch.zeros(1))
+        self.v_head  = nn.Linear(hidden, 1)
+    def extract_features(self, obs):
+        if not hasattr(self, "shared"):
+            self._build(obs.shape[-1])
+        return self.shared(obs)
+    def forward(self, obs, deterministic=False):
+        latent = self.extract_features(obs)
+        mean   = torch.tanh(self.mu_head(latent))
+        std    = self.log_std.exp().expand_as(mean)
+        dist   = Normal(mean, std)
+        action = mean if deterministic else torch.tanh(dist.rsample())
+        logp   = dist.log_prob(action).sum(dim=-1, keepdim=True)
+        value  = self.v_head(latent)
+        return action, value, logp
+
+# ===========================================================
+#  4.  Minimal training‑metric callback
+# ===========================================================
+class SimpleMetrics(BaseCallback):
+    def __init__(self): super().__init__()
+    def _on_training_end(self):
+        path = "brace_gamma_ppo.zip"
+        self.model.save(path)
+        print("✓ model saved to", path)
+
+# ===========================================================
+#  5.  Train / watch
+# ===========================================================
+def train(timesteps:int=600_000):
+    env = DummyVecEnv([lambda: BraceArbitrationEnv()])
+    model = PPO(
+        GammaBeliefPolicy, env,
+        learning_rate=3e-4,
+        n_steps=1024, batch_size=1024, n_epochs=4,
+        gamma=0.995, gae_lambda=0.97,
+        clip_range=0.2, verbose=1,
+        tensorboard_log="./tb_brace")
+    model.learn(timesteps, callback=SimpleMetrics())
+
+def watch(path:str="brace_gamma_ppo.zip"):
+    model = PPO.load(path)
+    env = BraceArbitrationEnv()
+    obs, _ = env.reset()
+    done = trunc = False
+    ret = 0
+    while not (done or trunc):
+        a,_ = model.predict(obs, deterministic=True)
+        obs,r,done,trunc,_ = env.step(a)
+        ret += r
+    print("episode return:", ret)
+
+# ===========================================================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--watch", action="store_true")
+    parser.add_argument("--steps", type=int, default=600_000)
+    args = parser.parse_args()
+    if args.watch:
+        watch()
+    else:
+        train(args.steps)
+
