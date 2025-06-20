@@ -1,6 +1,6 @@
 # BRACE
 
-# BRACE: [Your Paper Title/Project Name Here] - Supplementary Material
+# BRACE - Supplementary Material
 
 This repository contains the supplementary code for the NeurIPS paper "[Your Paper Title Here]".
 The code implements the BRACE (Bayesian Reasoning and Action C)ollaboration Engine, including:
